@@ -1841,16 +1841,14 @@ def _export_table1_sidecar_from_memory(
     vt_measures_col, vt_mth_cols, vt_calendar = _column_layout_from_vtstack_headers(
         vtstack_rows[0]
     )
-    measures_col = measures_col or vt_measures_col
-    mth_cols = mth_cols or vt_mth_cols
     calendar = mth_calendar or vt_calendar
     csv_path = table1_csv_path_for(xlsx_path)
     _write_table1_csv(
         csv_path,
         vtstack_data_rows=vtstack_rows[1:],
-        mth_cols=mth_cols,
+        mth_cols=vt_mth_cols,
         mth_calendar=calendar,
-        measures_col=measures_col,
+        measures_col=vt_measures_col,
         brick_col=brick_col,
         pack_col=pack_col,
         market_col=market_col,
@@ -1916,15 +1914,20 @@ def export_table1_csv_from_xlsx(path: Path) -> Path:
     return csv_path
 
 
-def _keep_only_c_sheet_in_workbook(wb) -> str | None:
-    """Remove every sheet except the C- pivot tab."""
-    c_sheet = _find_sheet_by_prefix(list(wb.sheetnames), "C")
-    if not c_sheet:
-        return None
-    for name in list(wb.sheetnames):
-        if name != c_sheet:
+def _keep_com_sheets_in_workbook(wb) -> list[str]:
+    """Keep C-, O-, and M- pivot tabs; remove derived/extra sheets."""
+    names = list(wb.sheetnames)
+    keep: list[str] = []
+    for prefix in ("C", "O", "M"):
+        sheet = _find_sheet_by_prefix(names, prefix)
+        if sheet and sheet not in keep:
+            keep.append(sheet)
+    if not _find_sheet_by_prefix(names, "C"):
+        return []
+    for name in names:
+        if name not in keep:
             del wb[name]
-    return c_sheet
+    return keep
 
 
 def postprocess_iqvia_xlsx(
@@ -1938,7 +1941,7 @@ def postprocess_iqvia_xlsx(
     - One combined CSV with all sheets
 
     When *table1_only* is True (default for bot):
-    - Deliverable workbook: C sheet only
+    - Deliverable workbook: C + O + M sheets
     - Deliverable CSV: TABLE 1 sidecar only
     """
     del product  # kept for caller compatibility
@@ -2006,23 +2009,21 @@ def postprocess_iqvia_xlsx(
         table1_csv = _export_table1_sidecar_from_memory(
             xlsx_path,
             vtstack_rows,
-            mth_cols=vt_mth_cols,
-            mth_calendar=vt_calendar or mth_calendar,
-            measures_col=measures_col or vt_measures_col,
+            mth_calendar=mth_calendar,
             pack1_map=pack1_map,
             pack2_map=pack2_map,
         )
         _apply_auto_filters_to_workbook(wb)
-        kept = _keep_only_c_sheet_in_workbook(wb)
+        kept = _keep_com_sheets_in_workbook(wb)
         if not kept:
             wb.close()
-            raise RuntimeError(f"No C sheet to keep in {xlsx_path.name}")
+            raise RuntimeError(f"No C/O/M sheets to keep in {xlsx_path.name}")
         _save_workbook_atomic(wb, xlsx_path)
         wb.close()
         xlsx_mb = xlsx_path.stat().st_size / 1024 / 1024
         csv_mb = table1_csv.stat().st_size / 1024 / 1024
         logger.info(
-            "Post-processed %s — C sheet only (%.1f MB) → %s (%.1f MB)",
+            "Post-processed %s — C/O/M sheets (%.1f MB) → %s (%.1f MB)",
             xlsx_path.name,
             xlsx_mb,
             table1_csv.name,

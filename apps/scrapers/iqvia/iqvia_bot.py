@@ -415,7 +415,7 @@ class IqviaBot:
     def _export_report_xlsx(self, page, product_name: str) -> Path:
         product_name = product_name.strip()
         logger.info(
-            "Export — product %r, wait for query, export %r (post-process → C xlsx + TABLE1 csv)…",
+            "Export — product %r, wait for query, export %r (post-process → C+O+M xlsx + TABLE1 csv)…",
             product_name,
             EXPORT_ALL_SHEETS_LABEL,
         )
@@ -668,7 +668,7 @@ class IqviaBot:
         logger.info(
             "Step 16b skipped — user confirmed pivots already expanded"
         )
-        logger.info("Step 17 — export C/O/M, deliver C xlsx + TABLE1 csv…")
+        logger.info("Step 17 — export C/O/M, deliver C+O+M xlsx + TABLE1 csv…")
         return self._run_step(
             lambda: self._export_report_xlsx(
                 create_report.active_page(),
