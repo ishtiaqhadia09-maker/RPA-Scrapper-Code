@@ -1,0 +1,44 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files (secrets/local config)
+.env
+.env.*
+
+# Local/generated data
+data/
+!data/iqvia/
+data/iqvia/*
+!data/iqvia/report_sources.tsv
+!data/iqvia/.gitkeep
+
+# Runtime log files
+*.log
+
+# SQLite job history (project root)
+rpa_jobs.db
+rpa_jobs.db-journal
+rpa_jobs.db-wal
+rpa_jobs.db-shm
+
+# Browser auth sessions (cookies/local state)
+auth/
+iqvia_auth.json
+
+# Test/cache tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
