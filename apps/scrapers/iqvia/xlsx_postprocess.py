@@ -1916,15 +1916,30 @@ def export_table1_csv_from_xlsx(path: Path) -> Path:
     return csv_path
 
 
+def _keep_only_c_sheet_in_workbook(wb) -> str | None:
+    """Remove every sheet except the C- pivot tab."""
+    c_sheet = _find_sheet_by_prefix(list(wb.sheetnames), "C")
+    if not c_sheet:
+        return None
+    for name in list(wb.sheetnames):
+        if name != c_sheet:
+            del wb[name]
+    return c_sheet
+
+
 def postprocess_iqvia_xlsx(
-    path: Path, *, product: str, zip_for_delivery: bool = True
+    path: Path, *, product: str, zip_for_delivery: bool = True, table1_only: bool = False
 ) -> Path:
     """
-    Normalize IQVIA Excel download:
-    - Workbook: C/O/M + VTSTACK + RAW FOR NEXT STAGE + TABLE 1 (Attribute/Value)
-    - One combined CSV with all sheets (first column = Sheet name)
+    Normalize IQVIA Excel download.
 
-    Returns the combined CSV path.
+    When *table1_only* is False (legacy):
+    - Workbook: C/O/M + VTSTACK + RAW FOR NEXT STAGE + TABLE 1
+    - One combined CSV with all sheets
+
+    When *table1_only* is True (default for bot):
+    - Deliverable workbook: C sheet only
+    - Deliverable CSV: TABLE 1 sidecar only
     """
     del product  # kept for caller compatibility
     xlsx_path = _normalize_download_to_xlsx(Path(path))
@@ -1982,6 +1997,38 @@ def postprocess_iqvia_xlsx(
         raise RuntimeError(
             f"Could not find MTH columns on sheet {c_sheet!r} in {xlsx_path.name}"
         )
+
+    vt_measures_col, vt_mth_cols, vt_calendar = _column_layout_from_vtstack_headers(
+        vtstack_rows[0]
+    )
+
+    if table1_only:
+        table1_csv = _export_table1_sidecar_from_memory(
+            xlsx_path,
+            vtstack_rows,
+            mth_cols=vt_mth_cols,
+            mth_calendar=vt_calendar or mth_calendar,
+            measures_col=measures_col or vt_measures_col,
+            pack1_map=pack1_map,
+            pack2_map=pack2_map,
+        )
+        _apply_auto_filters_to_workbook(wb)
+        kept = _keep_only_c_sheet_in_workbook(wb)
+        if not kept:
+            wb.close()
+            raise RuntimeError(f"No C sheet to keep in {xlsx_path.name}")
+        _save_workbook_atomic(wb, xlsx_path)
+        wb.close()
+        xlsx_mb = xlsx_path.stat().st_size / 1024 / 1024
+        csv_mb = table1_csv.stat().st_size / 1024 / 1024
+        logger.info(
+            "Post-processed %s — C sheet only (%.1f MB) → %s (%.1f MB)",
+            xlsx_path.name,
+            xlsx_mb,
+            table1_csv.name,
+            csv_mb,
+        )
+        return compress_for_delivery(table1_csv) if zip_for_delivery else table1_csv
 
     vtstack_sheet = _add_vtstack_sheet(wb, vtstack_rows=vtstack_rows)
     vt_index = _build_header_index([_cell_text(v) for v in vtstack_rows[0]])
