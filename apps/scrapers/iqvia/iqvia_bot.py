@@ -31,6 +31,9 @@ from apps.scrapers.iqvia.xlsx_postprocess import (
     combined_csv_path_for,
     compress_for_delivery,
     postprocess_iqvia_xlsx,
+    table1_csv_path_for,
+    vtstack_csv_path_for,
+    raw_csv_path_for,
 )
 from apps.scrapers.iqvia.page_locators import (
     CreateReportPage,
@@ -287,6 +290,7 @@ class IqviaBot:
             xlsx_path,
             product=product_name.strip(),
             zip_for_delivery=self.zip_for_delivery,
+            table1_only=True,
         )
 
     def _sanitize_filename_part(self, value: str) -> str:
@@ -411,8 +415,7 @@ class IqviaBot:
     def _export_report_xlsx(self, page, product_name: str) -> Path:
         product_name = product_name.strip()
         logger.info(
-            "Export — product %r, wait for query, export all sheets (%r) "
-            "with Excel options…",
+            "Export — product %r, wait for query, export %r (post-process → C xlsx + TABLE1 csv)…",
             product_name,
             EXPORT_ALL_SHEETS_LABEL,
         )
@@ -488,7 +491,7 @@ class IqviaBot:
                 final_xlsx.unlink()
             shutil.move(temp_destination, final_xlsx)
 
-        final_csv = combined_csv_path_for(final_xlsx)
+        final_csv = table1_csv_path_for(final_xlsx)
         src_csv = temp_destination.parent / f"{source_stem}.csv"
         if src_csv.is_file() and src_csv != final_csv:
             if final_csv.exists():
@@ -500,10 +503,15 @@ class IqviaBot:
                     final_csv.unlink()
                 shutil.move(processed, final_csv)
 
-        for legacy_suffix in ("_VTSTACK.csv", "_RAW.csv", "_TABLE1.csv"):
-            legacy = final_xlsx.parent / f"{final_xlsx.stem}{legacy_suffix}"
-            if legacy.exists():
-                legacy.unlink()
+        combined_csv = combined_csv_path_for(final_xlsx)
+        if combined_csv.is_file():
+            combined_csv.unlink()
+        for sidecar in (
+            vtstack_csv_path_for(final_xlsx),
+            raw_csv_path_for(final_xlsx),
+        ):
+            if sidecar.is_file():
+                sidecar.unlink()
 
         if processed.suffix.lower() == ".zip":
             final_zip = final_xlsx.with_suffix(".zip")
@@ -660,7 +668,7 @@ class IqviaBot:
         logger.info(
             "Step 16b skipped — user confirmed pivots already expanded"
         )
-        logger.info("Step 17 — export all sheets (C/O/M) as Excel + VTSTACK/RAW/TABLE1…")
+        logger.info("Step 17 — export C/O/M, deliver C xlsx + TABLE1 csv…")
         return self._run_step(
             lambda: self._export_report_xlsx(
                 create_report.active_page(),
