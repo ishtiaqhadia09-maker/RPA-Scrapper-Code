@@ -10,7 +10,13 @@ runpy.run_path(str(_ui_dir / "load_setup.py"), run_name="_load_setup")
 
 import streamlit as st
 
-from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR
+from apps.core.paths import (
+    DEFAULT_IQVIA_DOWNLOAD_DIR,
+    PROJECT_ROOT,
+    format_path_for_env,
+    get_iqvia_download_dir,
+)
+from apps.core.utils.read_utils import ReadConfig
 from apps.engines.pipeline import get_data_summary, get_job_status
 from ui.components import (
     get_active_job,
@@ -50,16 +56,44 @@ st.caption(
     "the exported file under the download folder."
 )
 
+def _load_saved_download_dir() -> str:
+    try:
+        ReadConfig.reload()
+        raw = ReadConfig.get("IQVIA_DOWNLOAD_DIR", "").strip()
+        if raw:
+            return str(get_iqvia_download_dir())
+    except FileNotFoundError:
+        pass
+    return str(DEFAULT_IQVIA_DOWNLOAD_DIR)
+
+
+def _persist_download_dir(path_str: str) -> Path:
+    cleaned = path_str.strip()
+    if not cleaned:
+        raise ValueError("Download directory cannot be empty.")
+    resolved = Path(cleaned).expanduser()
+    if not resolved.is_absolute():
+        resolved = (PROJECT_ROOT / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    ReadConfig.set("IQVIA_DOWNLOAD_DIR", format_path_for_env(resolved))
+    return resolved
+
+
+if "download_dir_pref" not in st.session_state:
+    st.session_state["download_dir_pref"] = _load_saved_download_dir()
+
 if st.session_state.get("_download_running"):
     _unlock_download_form_when_done()
 
-summary = get_data_summary()
-download_dir_path = Path(DEFAULT_IQVIA_DOWNLOAD_DIR)
+download_dir_path = Path(st.session_state["download_dir_pref"])
 recent_files = sorted(
     download_dir_path.glob("*"),
     key=lambda path: path.stat().st_mtime,
     reverse=True,
 ) if download_dir_path.is_dir() else []
+
+summary = get_data_summary()
 
 metric_cols = st.columns(2)
 metric_cols[0].metric("Files in download folder", summary["downloads"])
@@ -79,7 +113,7 @@ render_report_sources_panel(disabled=controls_locked)
 with st.form("download_form"):
     download_dir = st.text_input(
         "Download directory",
-        value=str(DEFAULT_IQVIA_DOWNLOAD_DIR),
+        value=st.session_state["download_dir_pref"],
         disabled=controls_locked,
     )
     headless = st.checkbox(
@@ -106,25 +140,31 @@ with st.form("download_form"):
     )
 
 if submitted and not controls_locked:
-    if run_pipeline:
-        pipeline = _reload_module("apps.engines.pipeline")
-        job_id = pipeline.start_full_workflow(
-            headless=headless,
-            keep_open=keep_open,
-            download_dir=download_dir,
-        )
-        st.success(f"Full pipeline started — job `{job_id}`")
+    try:
+        saved_download_dir = _persist_download_dir(download_dir)
+    except ValueError as exc:
+        st.error(str(exc))
     else:
-        download_worker = _reload_module("apps.workers.download_worker")
-        job_id = download_worker.start_download_job(
-            headless=headless,
-            keep_open=keep_open,
-            download_dir=download_dir,
-        )
-        st.success(f"Download job started — job `{job_id}`")
-    store_active_job(job_id)
-    st.session_state["_download_running"] = True
-    st.rerun()
+        st.session_state["download_dir_pref"] = str(saved_download_dir)
+        if run_pipeline:
+            pipeline = _reload_module("apps.engines.pipeline")
+            job_id = pipeline.start_full_workflow(
+                headless=headless,
+                keep_open=keep_open,
+                download_dir=str(saved_download_dir),
+            )
+            st.success(f"Full pipeline started — job `{job_id}`")
+        else:
+            download_worker = _reload_module("apps.workers.download_worker")
+            job_id = download_worker.start_download_job(
+                headless=headless,
+                keep_open=keep_open,
+                download_dir=str(saved_download_dir),
+            )
+            st.success(f"Download job started — job `{job_id}`")
+        store_active_job(job_id)
+        st.session_state["_download_running"] = True
+        st.rerun()
 
 st.subheader("Active job (live)")
 render_live_job_status(get_active_job(), controls_locked=controls_locked)
@@ -155,4 +195,4 @@ if recent_files:
         use_container_width=True,
     )
 else:
-    st.info(f"No files in `{DEFAULT_IQVIA_DOWNLOAD_DIR}` yet.")
+    st.info(f"No files in `{download_dir_path}` yet.")

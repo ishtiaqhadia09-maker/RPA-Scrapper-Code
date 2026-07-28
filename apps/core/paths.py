@@ -46,6 +46,26 @@ DEFAULT_IQVIA_DOWNLOAD_DIR = _resolve_path_from_env(
     "IQVIA_DOWNLOAD_DIR", _DEFAULT_IQVIA_DOWNLOAD_DIR
 )
 DEFAULT_DBF_INPUT_DIR = _resolve_path_from_env("DBF_INPUT_DIR", _DEFAULT_DBF_INPUT_DIR)
+
+
+def get_iqvia_download_dir() -> Path:
+    """Return the configured IQVIA download folder (re-reads .env each call)."""
+    return _resolve_path_from_env("IQVIA_DOWNLOAD_DIR", _DEFAULT_IQVIA_DOWNLOAD_DIR)
+
+
+def format_path_for_env(path: Path) -> str:
+    """Store paths relative to the project root when possible."""
+    resolved = path.expanduser()
+    if not resolved.is_absolute():
+        resolved = (PROJECT_ROOT / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
 # Each conversion run writes to a new timestamped folder under PROCESSED_DIR.
 PROCESSED_RUN_DIR_FORMAT = "%Y-%m-%d_%H-%M-%S"
 

@@ -38,6 +38,35 @@ class ReadConfig:
         cls._cache = None
 
     @classmethod
+    def set(cls, key: str, value: str, *, env_path: Path | None = None) -> None:
+        """Update or append one key in the project .env file."""
+        path = env_path or _DEFAULT_ENV
+        line = f"{key}={value}"
+
+        if path.is_file():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            updated = False
+            for index, existing in enumerate(lines):
+                stripped = existing.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                existing_key, _ = stripped.split("=", 1)
+                if existing_key.strip() == key:
+                    lines[index] = line
+                    updated = True
+                    break
+            if not updated:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append(line)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(line + "\n", encoding="utf-8")
+
+        cls.reload()
+
+    @classmethod
     def get(cls, key: str, default: str = "") -> str:
         return cls._config().get(key, default)
 

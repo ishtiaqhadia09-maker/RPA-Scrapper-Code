@@ -10,7 +10,7 @@ from typing import Any
 from apps.core.job_logging import attach_logger_to_module, count_files, setup_job_logger
 from apps.core.job_models import JobRecord
 from apps.core.job_registry import get_registry
-from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, ensure_data_dirs
+from apps.core.paths import ensure_data_dirs, get_iqvia_download_dir
 from apps.core.utils.read_utils import ReadConfig
 from apps.scrapers.iqvia.report_sources import resolve_report_sources_path
 
@@ -43,7 +43,7 @@ def run_download(
 ) -> dict[str, Any]:
     """Run IQVIA download synchronously (used by workers and pipeline)."""
     ensure_data_dirs()
-    target_dir = download_dir or DEFAULT_IQVIA_DOWNLOAD_DIR
+    target_dir = download_dir or get_iqvia_download_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     registry = get_registry()
 
@@ -85,7 +85,7 @@ def _execute_download_job(job: JobRecord, **kwargs: Any) -> None:
     logger = setup_job_logger(job.job_id, job.job_type)
     attach_logger_to_module(SCRAPER_LOGGER_NAME, logger)
     logger.info("Starting download job")
-    logger.info("Download folder: %s", kwargs.get("download_dir") or DEFAULT_IQVIA_DOWNLOAD_DIR)
+    logger.info("Download folder: %s", kwargs.get("download_dir") or get_iqvia_download_dir())
     report_sources_path = resolve_report_sources_path()
     logger.info("Report sources file: %s", report_sources_path)
     ReadConfig.reload()

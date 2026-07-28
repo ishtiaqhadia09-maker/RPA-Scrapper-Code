@@ -26,7 +26,11 @@ from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, PROCESSED_RUN_DIR_FORMAT
 from apps.core.utils.auth_utils import AuthSessionManager
 from apps.core.utils.read_utils import ReadConfig
 from apps.scrapers.iqvia.automation_guard import AutomationGuard
-from apps.scrapers.iqvia.config import browser_context_kwargs, chromium_launch_kwargs
+from apps.scrapers.iqvia.config import (
+    DOWNLOAD_TIMEOUT_MS,
+    browser_context_kwargs,
+    chromium_launch_kwargs,
+)
 from apps.scrapers.iqvia.xlsx_postprocess import (
     combined_csv_path_for,
     compress_for_delivery,
@@ -43,24 +47,28 @@ from apps.scrapers.iqvia.page_locators import (
     HubPage,
     LoginPage,
     ReportPage,
-    _poll_until,
 )
 from apps.scrapers.iqvia.report_sources import ReportSourceRow, load_report_sources
+from apps.scrapers.iqvia.session_auth import (
+    DECISION_CENTER_TITLE,
+    INCOMPLETE_LOGIN_TITLES,
+    IqviaSessionAuthMixin,
+    LOGIN_TITLE,
+)
 
 logger = logging.getLogger(__name__)
 
 SCRAPER_NAME = "iqvia"
 DEFAULT_ENTRY_URL = "https://hub.bi.iqvia.com/iam/"
-DECISION_CENTER_TITLE = "Decision Center"
-LOGIN_TITLE = "Login"
-DOWNLOAD_TIMEOUT_MS = 600_000
 MIN_XLSX_BYTES = 50_000
 MAX_PRODUCT_ATTEMPTS = 3
 EXPORT_ALL_SHEETS_LABEL = "All"
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 
 
-class IqviaBot:
+class IqviaBot(IqviaSessionAuthMixin):
+    _scraper_name = SCRAPER_NAME
+
     def __init__(
         self,
         headless: bool = False,
@@ -68,7 +76,7 @@ class IqviaBot:
         report_limit: int | None = None,
         start_row: int = 1,
         only_row: int | None = None,
-        zip_for_delivery: bool = True,
+        zip_for_delivery: bool = False,
     ) -> None:
         ensure_data_dirs()
         ReadConfig.reload()
@@ -212,14 +220,15 @@ class IqviaBot:
         title = page.title()
         logger.info("Step 3 — checking page after navigation (title: %r)", title)
 
-        if self._should_perform_login(title):
-            logger.info("Login required — signing in...")
-            self._perform_login(LoginPage(page))
-            self.auth.save_auth_from_context(self.context, SCRAPER_NAME)
-            self._wait_for_decision_center()
+        if title != DECISION_CENTER_TITLE:
+            self._ensure_authenticated()
             title = page.title()
-            logger.info("After login — URL: %s, title: %r", page.url, title)
-            self._refresh_automation_guard()
+        elif self.auth.auth_file_exists(SCRAPER_NAME):
+            logger.info(
+                "Reusing saved auth session (%s)",
+                self.auth.get_auth_path(SCRAPER_NAME),
+            )
+            self._persist_auth_session()
 
         if title == DECISION_CENTER_TITLE:
             self._automation_lock()
@@ -230,34 +239,6 @@ class IqviaBot:
                 DECISION_CENTER_TITLE,
                 title,
             )
-
-    def _should_perform_login(self, title: str) -> bool:
-        if not self.auth.auth_file_exists(SCRAPER_NAME):
-            logger.info("Auth file missing — login will run and auth will be saved")
-            return True
-        if title == LOGIN_TITLE:
-            logger.info("Login page detected with existing auth — re-authenticating")
-            return True
-        return False
-
-    def _wait_for_decision_center(self, timeout_sec: int = 120) -> None:
-        if self.page is None:
-            raise RuntimeError("Browser page not initialized")
-
-        page = self.page
-        if _poll_until(
-            page,
-            lambda: page.title() == DECISION_CENTER_TITLE,
-            timeout_ms=timeout_sec * 1_000,
-            poll_ms=200,
-        ):
-            logger.info("Decision Center loaded")
-            return
-
-        raise TimeoutError(
-            f"Decision Center (title {DECISION_CENTER_TITLE!r}) did not load "
-            f"within {timeout_sec}s — current title: {page.title()!r}"
-        )
 
     def _perform_login(self, login: LoginPage) -> None:
         if not self.username.strip() or not self.password.strip():
@@ -272,7 +253,7 @@ class IqviaBot:
                 self.username,
                 self.password,
                 otp=ReadConfig.getOtp(),
-                allow_manual_otp=not self.headless,
+                allow_manual_otp=True,
                 guard=self.guard,
             )
         finally:
@@ -402,7 +383,7 @@ class IqviaBot:
                         found = dest
                     return self._finalize_product_download(found, product_name)
 
-                page.wait_for_timeout(1_000)
+                page.wait_for_timeout(500)
 
             raise TimeoutError(
                 f"No download received within {DOWNLOAD_TIMEOUT_MS // 1000}s "
@@ -836,18 +817,20 @@ class IqviaBot:
             time.sleep(0.5)
         logger.info("Browser window closed by user")
 
+    def _persist_auth_session(self) -> None:
+        if self.context is None:
+            return
+        try:
+            title = self.page.title() if self.page else ""
+        except Exception:
+            return
+        if title in INCOMPLETE_LOGIN_TITLES:
+            return
+        self.auth.save_auth_from_context(self.context, SCRAPER_NAME)
+        logger.info("Auth session saved to %s", self.auth.get_auth_path(SCRAPER_NAME))
+
     def close(self) -> None:
-        if self.guard:
-            self.guard.disable()
-        if self.context:
-            try:
-                self.context.close()
-            except Exception:
-                pass
-        if self.browser and self.browser.is_connected():
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
+        self._teardown_browser(persist_auth=True)
 
 
 if __name__ == "__main__":

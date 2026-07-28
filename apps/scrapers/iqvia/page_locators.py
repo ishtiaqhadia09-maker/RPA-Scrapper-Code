@@ -4,14 +4,22 @@ import time
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
+from apps.scrapers.iqvia.config import (
+    COLUMN_EXPAND_PAUSE_MS,
+    DIALOG_SETTLE_MS,
+    FRAME_POLL_MS,
+    POLL_MS,
+    QUERY_EXPORT_MAX_WAIT_MS,
+    QUERY_EXPORT_POLL_MS,
+    QUERY_EXPORT_STABLE_CHECKS,
+    QUERY_IDLE_POLL_MS,
+    SETTLE_MS,
+    SLOW_POLL_MS,
+)
 from apps.scrapers.iqvia.report_sources import normalize_database_catalog
 
 logger = logging.getLogger(__name__)
 
-FRAME_POLL_MS = 100
-SETTLE_MS = 50
-POLL_MS = 100
-SLOW_POLL_MS = 400
 DEFAULT_FRAME_TIMEOUT_MS = 120_000
 DROPDOWN_ITEM_SELECTOR = (
     ".rcbSlide .rcbItem:visible, "
@@ -78,6 +86,8 @@ class LoginPage:
     textbox_otp = "#inputVerificationCode"
     trust_checkbox = "#chkRememberDevice"
     password_url_fragment = "/account/password"
+    VERIFICATION_CODE_TITLE = "Verification Code"
+    DECISION_CENTER_TITLE = "Decision Center"
     POPUP_LOGOUT = 'div[class="mat-menu-trigger user-nav"]'
     OPTION_LOGOUT = 'button[role="menuitem"][tabindex="0"]:nth-of-type(3)'
 
@@ -149,35 +159,116 @@ class LoginPage:
         self.clickSubmit()
         self.page.wait_for_load_state("domcontentloaded")
 
-        if self.is_otp_visible(timeout_ms=12_000):
-            if otp.strip():
-                logger.info("Entering OTP from .env…")
-                self.setOtp(otp)
-                self.clickSubmit()
-                self.page.wait_for_load_state("domcontentloaded")
-            elif allow_manual_otp:
-                if guard is not None and hasattr(guard, "disable"):
-                    guard.disable()
-                logger.info(
-                    "OTP required — enter the code in the browser window "
-                    "(check 'Trust this device' if shown). Waiting up to 120s…"
-                )
-                try:
-                    self._wait_for_otp_completion(timeout_sec=120)
-                finally:
-                    if guard is not None and hasattr(guard, "enable"):
-                        guard.enable()
-                        guard.refresh()
-            else:
-                raise RuntimeError(
-                    "OTP required but IQVIA_OTP is not set in .env. "
-                    "Add the code from your email/SMS, or run with a visible "
-                    "browser to enter OTP manually."
-                )
+        self._handle_verification(
+            otp,
+            allow_manual_otp=allow_manual_otp,
+            guard=guard,
+        )
+        if self.page.title() != self.DECISION_CENTER_TITLE:
+            self._wait_for_login_landing(timeout_sec=180)
 
-        if self.is_trust_checkbox_visible(timeout_ms=8_000):
+    def is_verification_page(self, timeout_ms: int = 0) -> bool:
+        try:
+            if self.page.title() == self.VERIFICATION_CODE_TITLE:
+                return True
+        except Exception:
+            pass
+        if timeout_ms > 0:
+            return self._is_visible(self.textbox_otp, timeout_ms)
+        return False
+
+    def _wait_for_verification_page(self, timeout_ms: int = 20_000) -> bool:
+        return _poll_until(
+            self.page,
+            lambda: self.is_verification_page(timeout_ms=500),
+            timeout_ms=timeout_ms,
+        )
+
+    def _handle_verification(
+        self,
+        otp: str,
+        *,
+        allow_manual_otp: bool,
+        guard: object | None,
+    ) -> None:
+        if not self._wait_for_verification_page(timeout_ms=20_000):
+            return
+
+        if otp.strip():
+            logger.info("Entering OTP from .env…")
+            self.setOtp(otp)
+        elif allow_manual_otp:
+            if guard is not None and hasattr(guard, "disable"):
+                guard.disable()
+            logger.info(
+                "Verification code required — enter OTP in the browser "
+                "(check 'Trust this device' if shown). Waiting up to 180s…"
+            )
+            try:
+                if not self._wait_for_verification_code_entry(timeout_sec=180):
+                    raise TimeoutError(
+                        f"OTP not entered within 180s — current title: "
+                        f"{self.page.title()!r}"
+                    )
+            finally:
+                if guard is not None and hasattr(guard, "enable"):
+                    guard.enable()
+                    guard.refresh()
+        else:
+            raise RuntimeError(
+                "Verification code required but IQVIA_OTP is not set in .env. "
+                "Add the code from your email/SMS, or run with a visible "
+                "browser to enter OTP manually."
+            )
+
+        self._submit_verification_form()
+
+    def _wait_for_verification_code_entry(self, timeout_sec: int = 180) -> bool:
+        def ready() -> bool:
+            if self.page.title() == self.DECISION_CENTER_TITLE:
+                return True
+            if not self.is_verification_page(timeout_ms=200):
+                return True
+            try:
+                value = self.page.locator(self.textbox_otp).input_value().strip()
+            except Exception:
+                value = ""
+            return bool(value)
+
+        return _poll_until(
+            self.page,
+            ready,
+            timeout_ms=timeout_sec * 1_000,
+            poll_ms=200,
+        )
+
+    def _submit_verification_form(self) -> None:
+        if not self.is_verification_page(timeout_ms=500):
+            return
+
+        if self.is_trust_checkbox_visible(timeout_ms=3_000):
             logger.info("Checking 'Trust this device'…")
             self.clickTrustCheckbox()
+
+        if self.is_verification_page(timeout_ms=500):
+            logger.info("Submitting verification code…")
+            self.clickSubmit()
+            self.page.wait_for_load_state("domcontentloaded")
+
+    def _wait_for_login_landing(self, timeout_sec: int = 180) -> None:
+        if _poll_until(
+            self.page,
+            lambda: self.page.title() == self.DECISION_CENTER_TITLE,
+            timeout_ms=timeout_sec * 1_000,
+            poll_ms=200,
+        ):
+            logger.info("Decision Center loaded after login")
+            return
+
+        raise TimeoutError(
+            f"Decision Center (title {self.DECISION_CENTER_TITLE!r}) did not load "
+            f"within {timeout_sec}s — current title: {self.page.title()!r}"
+        )
 
     def _wait_for_otp_completion(self, timeout_sec: int = 120) -> None:
         if _poll_until(
@@ -3582,15 +3673,14 @@ class CreateReportPage:
                 px = fbox["x"] + target["x"]
                 py = fbox["y"] + target["y"]
                 frame.page.mouse.click(px, py)
-                frame.wait_for_timeout(500)
-                self._wait_for_query_idle(frame)
+                frame.wait_for_timeout(COLUMN_EXPAND_PAUSE_MS)
                 logger.info("Expanded column %r (+ icon)", target.get("text"))
                 expanded_any = True
 
-            frame.wait_for_timeout(400)
+            if expanded_any:
+                self._wait_for_query_idle(frame)
+            frame.wait_for_timeout(COLUMN_EXPAND_PAUSE_MS)
 
-        if expanded_any:
-            self._wait_for_query_idle(frame)
         return expanded_any
 
     def _expand_collapsed_mat_column_headers(self, frame) -> bool:
@@ -3726,18 +3816,36 @@ class CreateReportPage:
         """Expand MAT/MTH column (+) icons, then Product/Pack → Expand Members."""
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
-        logger.info("Expanding collapsed MAT/MTH column headers (+ icon)…")
 
-        if not self._expand_collapsed_column_headers(frame):
-            logger.info("No collapsed column headers found — already expanded")
-        else:
+        col_collapsed = bool(self._find_collapsed_column_expand_targets(frame))
+        row_collapsed = self._pivot_has_collapsed_row_members(frame)
+        if not col_collapsed and not row_collapsed:
+            logger.info(
+                "Pivot columns and row members already expanded — skipping step 13c"
+            )
+            return
+
+        if col_collapsed:
+            logger.info("Expanding collapsed MAT/MTH column headers (+ icon)…")
+            self._expand_collapsed_column_headers(frame)
             logger.info("Column header expansion complete")
+        else:
+            logger.info("No collapsed column headers found — already expanded")
 
-        self._expand_all_pivot_row_members(frame)
+        if row_collapsed:
+            self._expand_all_pivot_row_members(frame)
+        else:
+            logger.info("Pivot row members already expanded")
 
     def _expand_pivot_row_members(self, dimension: str) -> None:
         """Pivot row filter menu → Expand Members (Product, Pack, Brick, …)."""
         frame = self._designer_frame()
+        if not self._pivot_has_collapsed_row_members(frame):
+            logger.info(
+                "No collapsed %r row members — skipping Expand Members",
+                dimension,
+            )
+            return
         logger.info(
             "Expanding %r row members (%r → %r)…",
             dimension,
@@ -3849,7 +3957,7 @@ class CreateReportPage:
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
         self._clear_open_popups(frame)
-        frame.wait_for_timeout(800)
+        frame.wait_for_timeout(DIALOG_SETTLE_MS)
         self.remove_pivot_dimension(self.pack_attribute)
         self.move_market_dimension_to_row()
         logger.info("Sheet M ready — %r", name)
@@ -6643,7 +6751,7 @@ class CreateReportPage:
             return
         logger.info("Waiting for query to finish before pivot menu…")
         elapsed = 0
-        poll_ms = SLOW_POLL_MS
+        poll_ms = QUERY_IDLE_POLL_MS
         while elapsed < timeout_ms:
             if not self._is_query_running_visible(frame):
                 logger.info("Query finished — continuing")
@@ -10251,7 +10359,7 @@ class CreateReportPage:
         self._open_pivot_analyze_menu(frame)
         if not self._click_analyzer_menu_item(frame, self.display_totals_menu_text):
             self._click_menu_item(self.display_totals_menu_text)
-        frame.wait_for_timeout(1_000)
+        frame.wait_for_timeout(DIALOG_SETTLE_MS)
 
         self._wait_for_dialog(self.display_totals_dialog_title)
         if not self._click_display_totals_hide_totals():
@@ -10259,14 +10367,14 @@ class CreateReportPage:
                 f"Could not click {self.display_totals_hide_button_text!r} on "
                 f"{self.display_totals_dialog_title!r} dialog"
             )
-        frame.wait_for_timeout(800)
+        frame.wait_for_timeout(DIALOG_SETTLE_MS)
         if self._display_totals_dialog_visible():
             if not self._click_display_totals_ok():
                 logger.info(
                     "%r still open after Hide Totals — continuing",
                     self.display_totals_dialog_title,
                 )
-        frame.wait_for_timeout(1_000)
+        frame.wait_for_timeout(DIALOG_SETTLE_MS)
         self._clear_open_popups(frame)
         self._wait_for_query_idle(frame)
         logger.info("Display Totals hidden — proceeding to sheet rename/copy")
@@ -18284,14 +18392,16 @@ class DesignerPage:
             and not self._is_query_running_visible()
         )
 
-    def wait_for_query_complete(self, timeout_ms: int = 300_000) -> None:
+    def wait_for_query_complete(
+        self, timeout_ms: int = QUERY_EXPORT_MAX_WAIT_MS
+    ) -> None:
         frame = self._designer_frame()
         csv_button = frame.locator(self.csv_export_button)
         csv_button.wait_for(state="visible", timeout=timeout_ms)
 
-        poll_ms = 200
-        popup_appear_wait_sec = 15.0
-        stable_ready_checks = 3
+        poll_ms = QUERY_EXPORT_POLL_MS
+        popup_appear_wait_sec = 10.0
+        stable_ready_checks = QUERY_EXPORT_STABLE_CHECKS
         deadline = timeout_ms / 1_000
         elapsed = 0.0
         saw_running = False

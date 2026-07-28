@@ -1931,7 +1931,7 @@ def _keep_com_sheets_in_workbook(wb) -> list[str]:
 
 
 def postprocess_iqvia_xlsx(
-    path: Path, *, product: str, zip_for_delivery: bool = True, table1_only: bool = False
+    path: Path, *, product: str, zip_for_delivery: bool = False, table1_only: bool = False
 ) -> Path:
     """
     Normalize IQVIA Excel download.
