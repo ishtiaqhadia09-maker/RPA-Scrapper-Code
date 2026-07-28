@@ -20,17 +20,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
 from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, PROCESSED_RUN_DIR_FORMAT, ensure_data_dirs
 from apps.core.utils.auth_utils import AuthSessionManager
 from apps.core.utils.read_utils import ReadConfig
 from apps.scrapers.iqvia.automation_guard import AutomationGuard
-from apps.scrapers.iqvia.config import (
-    DOWNLOAD_TIMEOUT_MS,
-    browser_context_kwargs,
-    chromium_launch_kwargs,
-)
+from apps.scrapers.iqvia.config import DOWNLOAD_TIMEOUT_MS
+from apps.scrapers.iqvia.browser_session import open_browser_with_auth
 from apps.scrapers.iqvia.xlsx_postprocess import (
     combined_csv_path_for,
     compress_for_delivery,
@@ -111,6 +106,9 @@ class IqviaBot(IqviaSessionAuthMixin):
         self.context = None
         self.page = None
         self.guard: AutomationGuard | None = None
+        self._uses_chrome_profile = False
+        self._persistent_context = False
+        self._cdp_connected = False
 
     def _start_automation_guard(self) -> None:
         if self.context is None:
@@ -134,38 +132,9 @@ class IqviaBot(IqviaSessionAuthMixin):
             raise
 
     def _open_browser_with_auth(self) -> None:
-        """Step 1 — launch browser and apply saved auth before any navigation."""
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            **chromium_launch_kwargs(headless=self.headless)
-        )
-
-        auth_path = self.auth.get_auth_path(SCRAPER_NAME)
-        storage_state = self.auth.get_storage_state_path(SCRAPER_NAME)
+        """Step 1 — launch Chrome profile / saved session before navigation."""
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        context_kwargs = browser_context_kwargs(
-            headless=self.headless,
-            accept_downloads=True,
-        )
-
-        logger.info("Step 1 — opening browser (downloads → %s)", self.download_dir)
-        if storage_state:
-            logger.info("Step 1 — loading auth file: %s", auth_path)
-            self.context = self.browser.new_context(
-                storage_state=storage_state,
-                **context_kwargs,
-            )
-        else:
-            logger.warning(
-                "Step 1 — no auth file at %s; browser starts without saved session",
-                auth_path,
-            )
-            self.context = self.browser.new_context(**context_kwargs)
-
-        self.page = self.context.new_page()
-        self._configure_browser_downloads()
-        self._start_automation_guard()
-        logger.info("Step 1 complete — browser ready (navigation not started yet)")
+        open_browser_with_auth(self)
 
     def _configure_browser_downloads(self, page=None) -> None:
         """Point Chromium downloads at our iqvia folder (CDP + polling fallback)."""

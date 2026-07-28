@@ -32,13 +32,17 @@ class IqviaSessionAuthMixin:
             return False
 
     def _try_restore_session(self) -> bool:
-        if not self.auth.auth_file_exists(self._scraper_name) or self.page is None:
+        if self.page is None:
             return False
         if self._is_authenticated():
             return True
+        if not self.auth.auth_file_exists(self._scraper_name) and not getattr(
+            self, "_uses_chrome_profile", False
+        ):
+            return False
 
         logger.info(
-            "Auth file present — reloading %s with saved session…",
+            "Saved session present — reloading %s…",
             self.entry_url,
         )
         self.page.goto(
@@ -131,21 +135,6 @@ class IqviaSessionAuthMixin:
         )
 
     def _teardown_browser(self, *, persist_auth: bool = False) -> None:
-        if persist_auth:
-            self._persist_auth_session()
-        if self.guard:
-            self.guard.disable()
-            self.guard = None
-        if self.context:
-            try:
-                self.context.close()
-            except Exception:
-                pass
-            self.context = None
-        if self.browser and self.browser.is_connected():
-            self.browser.close()
-        self.browser = None
-        if self.playwright:
-            self.playwright.stop()
-            self.playwright = None
-        self.page = None
+        from apps.scrapers.iqvia.browser_session import teardown_browser
+
+        teardown_browser(self, persist_auth=persist_auth)
