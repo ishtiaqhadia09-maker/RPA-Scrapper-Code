@@ -70,11 +70,25 @@ ATTRIBUTE_VALUE_HEADERS = (
 VTSTACK_TYPE_OWN = "OWN"
 VTSTACK_TYPE_COMPETITOR = "COMPETITOR"
 VTSTACK_TYPE_MARKET = "Market"
-TABLE1_CSV_SUFFIX = "_TABLE1.csv"
 VTSTACK_CSV_SUFFIX = "_VTSTACK.csv"
 RAW_CSV_SUFFIX = "_RAW.csv"
 CSV_BATCH_SIZE = 50_000
 MAX_WORKBOOK_MB = 100
+_PROCESSED_STAMP_SUFFIX = re.compile(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+
+def _sanitize_filename_part(value: str) -> str:
+    sanitized = value.strip()
+    for char in '\\/:*?"<>|':
+        sanitized = sanitized.replace(char, "_")
+    return sanitized.strip().replace(" ", "_") or "export"
+
+
+def _product_stem_from_xlsx(xlsx_path: Path, *, product: str | None = None) -> str:
+    if product:
+        return _sanitize_filename_part(product)
+    stem = Path(xlsx_path).stem
+    return _PROCESSED_STAMP_SUFFIX.sub("", stem) or stem
 
 
 def combined_csv_path_for(xlsx_path: Path) -> Path:
@@ -82,10 +96,10 @@ def combined_csv_path_for(xlsx_path: Path) -> Path:
     return Path(xlsx_path).with_suffix(".csv")
 
 
-def table1_csv_path_for(xlsx_path: Path) -> Path:
-    """Sidecar CSV path for TABLE 1, e.g. CRESCOR_2026-07-07_TABLE1.csv."""
+def table1_csv_path_for(xlsx_path: Path, *, product: str | None = None) -> Path:
+    """Deliverable TABLE 1 CSV path, e.g. CRESCOR_EZE.csv."""
     path = Path(xlsx_path)
-    return path.with_name(f"{path.stem}{TABLE1_CSV_SUFFIX}")
+    return path.with_name(f"{_product_stem_from_xlsx(path, product=product)}.csv")
 
 
 def vtstack_csv_path_for(xlsx_path: Path) -> Path:
@@ -1784,6 +1798,7 @@ def _export_table1_sidecar(
     wb,
     xlsx_path: Path,
     *,
+    product: str | None = None,
     raw_row_count: int | None = None,
 ) -> Path:
     """Write TABLE 1 to a sidecar CSV next to the workbook."""
@@ -1800,7 +1815,7 @@ def _export_table1_sidecar(
         pack2_map,
         resolved_raw_row_count,
     ) = _resolve_table1_context(wb)
-    csv_path = table1_csv_path_for(xlsx_path)
+    csv_path = table1_csv_path_for(xlsx_path, product=product)
     _write_table1_csv(
         csv_path,
         vt_ws=wb[vtstack_sheet],
@@ -1826,6 +1841,7 @@ def _export_table1_sidecar_from_memory(
     xlsx_path: Path,
     vtstack_rows: list[list],
     *,
+    product: str | None = None,
     mth_cols: dict[str, int] | None = None,
     mth_calendar: dict[str, tuple[int, int]] | None = None,
     measures_col: int | None = None,
@@ -1842,7 +1858,7 @@ def _export_table1_sidecar_from_memory(
         vtstack_rows[0]
     )
     calendar = mth_calendar or vt_calendar
-    csv_path = table1_csv_path_for(xlsx_path)
+    csv_path = table1_csv_path_for(xlsx_path, product=product)
     _write_table1_csv(
         csv_path,
         vtstack_data_rows=vtstack_rows[1:],
@@ -1944,7 +1960,6 @@ def postprocess_iqvia_xlsx(
     - Deliverable workbook: C + O + M sheets
     - Deliverable CSV: TABLE 1 sidecar only
     """
-    del product  # kept for caller compatibility
     xlsx_path = _normalize_download_to_xlsx(Path(path))
 
     reader = load_workbook(xlsx_path, read_only=True, data_only=True)
@@ -2009,6 +2024,7 @@ def postprocess_iqvia_xlsx(
         table1_csv = _export_table1_sidecar_from_memory(
             xlsx_path,
             vtstack_rows,
+            product=product,
             mth_calendar=mth_calendar,
             pack1_map=pack1_map,
             pack2_map=pack2_map,

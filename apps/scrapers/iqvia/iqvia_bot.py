@@ -441,7 +441,7 @@ class IqviaBot(IqviaSessionAuthMixin):
                 final_xlsx.unlink()
             shutil.move(temp_destination, final_xlsx)
 
-        final_csv = table1_csv_path_for(final_xlsx)
+        final_csv = table1_csv_path_for(final_xlsx, product=product_name)
         src_csv = temp_destination.parent / f"{source_stem}.csv"
         if src_csv.is_file() and src_csv != final_csv:
             if final_csv.exists():
