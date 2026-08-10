@@ -3914,6 +3914,8 @@ class CreateReportPage:
             self.filter_menu_text,
             self.expand_members_menu_text,
         )
+        self._scroll_pivot_row_dimension_into_view(frame, dimension)
+        frame.wait_for_timeout(300)
 
         def _expand_menu_visible() -> bool:
             return self._is_menu_item_visible(
@@ -6838,14 +6840,7 @@ class CreateReportPage:
             raise PlaywrightTimeoutError(
                 f"{self.customize_filter_dialog_title!r} dialog did not open"
             )
-        dialog_scope, scope_info = self._resolve_customize_filter_scope(
-            timeout_ms=30_000
-        )
-        if dialog_scope is None:
-            raise PlaywrightTimeoutError(
-                f"{self.customize_filter_dialog_title!r} form controls did not load"
-            )
-        logger.info("Customize Filter dialog ready: %s", scope_info)
+        logger.info("%r dialog opened", self.customize_filter_dialog_title)
 
     def _open_pivot_row_dimension_dropdown(self, frame, dimension: str) -> None:
         """Open the pivot grid row-dimension header menu (Product / Pack / Brick).
@@ -6887,7 +6882,7 @@ class CreateReportPage:
                     if (!matchesDim(text) || text.length > 60) continue;
                     if (inTree(el)) continue;
                     const r = el.getBoundingClientRect();
-                    if (r.width <= 0 || r.height <= 0 || r.top > 320) continue;
+                    if (r.width <= 0 || r.height <= 0 || r.top > 720) continue;
                     const cell = el.closest('td, th') || el.parentElement;
                     if (clickArrowNear(cell)) return 'header-arrow';
                     const row = (cell || el).closest('tr');
@@ -6994,7 +6989,7 @@ class CreateReportPage:
                 };
             }
             """,
-            [dimension, tree_right, 90, 420],
+            [dimension, tree_right, 90, 720],
         )
 
     def _click_row_dimension_field_trigger(
@@ -7005,7 +7000,7 @@ class CreateReportPage:
         if loc is not None:
             try:
                 box = loc.bounding_box()
-                if box and 90 <= box["y"] <= 420:
+                if box and 90 <= box["y"] <= 720:
                     row = loc.locator(
                         "xpath=ancestor::tr[1] | ancestor::td[1]"
                     ).first
@@ -8906,12 +8901,22 @@ class CreateReportPage:
                                 }
                             }
 
+                            for (const inp of document.querySelectorAll(
+                                'input.rcbInput, input[type="text"]'
+                            )) {
+                                const v = trim(inp.value);
+                                if (v === 'Units' || v === 'Values') {
+                                    return { ready: true, via: 'rcbInput', value: v };
+                                }
+                            }
+
                             if (
                                 body.includes(dialogTitle)
                                 && (
                                     body.includes('Based on Measure')
                                     || body.includes('Count Manner')
                                     || body.includes('Based on Member')
+                                    || body.includes('Display Range')
                                 )
                             ) {
                                 return { ready: true, via: 'dialog-text' };
@@ -9259,9 +9264,12 @@ class CreateReportPage:
 
     def _apply_customize_top_count(self, count: int) -> None:
         measure = self.custom_top_based_on_measure
-        dialog_scope, scope_info = self._resolve_customize_filter_scope(
-            timeout_ms=30_000
-        )
+        dialog_scope = self._wait_for_real_customize_dialog(timeout_ms=45_000)
+        scope_info = None
+        if dialog_scope is None:
+            dialog_scope, scope_info = self._resolve_customize_filter_scope(
+                timeout_ms=30_000
+            )
         if dialog_scope is None:
             self._wait_for_dialog(
                 self.customize_filter_dialog_title, timeout_ms=8_000
@@ -13634,7 +13642,7 @@ class CreateReportPage:
                     if (!matches(span, packLabel)) continue;
                     const sr = span.getBoundingClientRect();
                     const r = td.getBoundingClientRect();
-                    if (r.width <= 0 || r.height <= 0 || r.top < 95 || r.top > 180) {
+                    if (r.width <= 0 || r.height <= 0 || r.top < 95 || r.top > 720) {
                         continue;
                     }
                     if (r.left < minLeft) continue;
@@ -17836,7 +17844,7 @@ class CreateReportPage:
                     if (!matches(span, dimension)) continue;
                     const r = td.getBoundingClientRect();
                     if (r.width <= 0 || r.height <= 0) continue;
-                    if (r.top < 100 || r.top > 320) continue;
+                    if (r.top < 100 || r.top > 720) continue;
                     if (r.left < minLeft) continue;
                     const sr = span.getBoundingClientRect();
                     const score = r.left;
@@ -17864,6 +17872,38 @@ class CreateReportPage:
             "page_y": fbox["y"] + hit["y"],
             "text": hit["text"],
         }
+
+    def _scroll_pivot_row_dimension_into_view(self, frame, dimension: str) -> None:
+        """Scroll a pivot row-dimension field header into the visible grid band."""
+        frame.evaluate(
+            """
+            ([dimension]) => {
+                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const tree = document.getElementById('trvSchema')
+                    || document.querySelector('[id*="trvSchema"]');
+                const inTree = (el) => !!(tree && tree.contains(el));
+                const matches = (span, label) => {
+                    if (!span) return false;
+                    const text = trim(span.textContent);
+                    const title = span.getAttribute('title') || '';
+                    return (
+                        text === label
+                        || text.startsWith(label + ' (')
+                        || title.includes('[' + label + '.')
+                        || title.includes('[' + label + ']')
+                    );
+                };
+                for (const td of document.querySelectorAll('td[area="rows"]')) {
+                    if (inTree(td)) continue;
+                    const span = td.querySelector('span[axis="r"], nobr span');
+                    if (!matches(span, dimension)) continue;
+                    td.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    return;
+                }
+            }
+            """,
+            [dimension],
+        )
 
     def _hover_pivot_dimension_menu_tab(self, frame) -> None:
         """Hover the Dimension(s) tab on the pivot field chevron menu."""
@@ -18047,7 +18087,7 @@ class CreateReportPage:
                     const span = td.querySelector('span[axis="r"], nobr span');
                     if (!matches(span, dimension)) continue;
                     const r = td.getBoundingClientRect();
-                    if (r.top < 90 || r.top > 400) continue;
+                    if (r.top < 90 || r.top > 720) continue;
                     if (r.left > bestLeft) {
                         bestLeft = r.left;
                         bestTd = td;
