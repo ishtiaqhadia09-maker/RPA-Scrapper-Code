@@ -722,10 +722,64 @@ class CreateReportPage:
             pass
         return self.page
 
+    def _dismiss_concurrent_session_if_present(self) -> bool:
+        """Click 'Disable the other connection and start to design' if shown."""
+        for page in reversed(self.page.context.pages):
+            frame = page.frame(
+                url=lambda url: url is not None
+                and "ConcurrentError.aspx" in url
+            )
+            if frame is None:
+                continue
+            try:
+                clicked = frame.evaluate(
+                    """
+                    () => {
+                        const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const candidates = [];
+                        for (const el of document.querySelectorAll(
+                            'input[type="button"], input[type="submit"], button, a'
+                        )) {
+                            const text = trim(el.value || el.textContent);
+                            if (!text) continue;
+                            const r = el.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            candidates.push({ el, text, top: r.top });
+                        }
+                        candidates.sort((a, b) => a.top - b.top);
+                        for (const c of candidates) {
+                            const lower = c.text.toLowerCase();
+                            if (
+                                c.text.includes('Disable')
+                                && lower.includes('design')
+                            ) {
+                                c.el.click();
+                                return c.text.slice(0, 100);
+                            }
+                        }
+                        if (candidates.length) {
+                            candidates[0].el.click();
+                            return candidates[0].text.slice(0, 100);
+                        }
+                        return null;
+                    }
+                    """
+                )
+                if clicked:
+                    logger.info(
+                        "Concurrent session dialog — clicked %r", clicked
+                    )
+                    page.wait_for_timeout(1500)
+                    return True
+            except Exception as exc:
+                logger.debug("Concurrent session dismiss failed: %s", exc)
+        return False
+
     def _designer_frame(self, timeout_ms: int = 120_000):
         """Return the designer iframe (may be on the current tab or a new one)."""
         attempts = max(1, timeout_ms // FRAME_POLL_MS)
         for _ in range(attempts):
+            self._dismiss_concurrent_session_if_present()
             for page in reversed(self.page.context.pages):
                 frame = page.frame(
                     url=lambda url: url is not None
@@ -748,6 +802,7 @@ class CreateReportPage:
 
     def wait_for_loaded(self, timeout_ms: int = 120_000) -> None:
         logger.info("Waiting for report designer…")
+        self._dismiss_concurrent_session_if_present()
         frame = self._designer_frame(timeout_ms=timeout_ms)
         logger.info("Designer frame found — waiting for Data Source controls…")
 
@@ -6407,7 +6462,14 @@ class CreateReportPage:
             drop_loc = frame.get_by_text(drop_zone_text, exact=False).first
             drop_loc.wait_for(state="visible", timeout=15_000)
         self._scroll_schema_label_into_view(frame, item_label)
-        drop_loc.scroll_into_view_if_needed()
+        self._dismiss_concurrent_session_if_present()
+        try:
+            drop_loc.scroll_into_view_if_needed()
+        except PlaywrightError:
+            if not self._dismiss_concurrent_session_if_present():
+                raise
+            drop_loc.wait_for(state="visible", timeout=15_000)
+            drop_loc.scroll_into_view_if_needed()
         self._settle(frame)
 
         if verify is None:
@@ -8169,6 +8231,8 @@ class CreateReportPage:
                             text === rangeMatch
                             || text.includes('show top')
                             || text.includes('top only')
+                            || text === 'top'
+                            || trim(opt.value).toLowerCase() === 'top'
                         ) {
                             select.value = opt.value;
                             select.dispatchEvent(
@@ -9007,6 +9071,36 @@ class CreateReportPage:
         current = self._customize_measure_current(scope)
         if current == measure or measure in current:
             logger.info("Based on Measure already %r", current or measure)
+            return
+
+        picked = scope.evaluate(
+            """
+            (measureName) => {
+                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                for (const sel of document.querySelectorAll('select')) {
+                    const opts = [...sel.options].map((o) => trim(o.textContent));
+                    if (!opts.includes('Units') || !opts.includes('Values')) continue;
+                    for (const opt of sel.options) {
+                        const text = trim(opt.textContent);
+                        if (text !== measureName && !text.includes(measureName)) {
+                            continue;
+                        }
+                        sel.value = opt.value;
+                        sel.selectedIndex = opt.index;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        sel.dispatchEvent(new Event('blur', { bubbles: true }));
+                        return text;
+                    }
+                }
+                return null;
+            }
+            """,
+            measure,
+        )
+        if picked:
+            logger.info(
+                "Set Based on Measure to %r (Units/Values select JS)", picked
+            )
             return
 
         if self._select_customize_measure_native_select(scope, measure):
