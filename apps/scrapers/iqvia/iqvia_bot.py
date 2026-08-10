@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, PROCESSED_RUN_DIR_FORMAT, ensure_data_dirs
+from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, ensure_data_dirs
 from apps.core.utils.auth_utils import AuthSessionManager
 from apps.core.utils.read_utils import ReadConfig
 from apps.scrapers.iqvia.automation_guard import AutomationGuard
@@ -250,11 +250,10 @@ class IqviaBot(IqviaSessionAuthMixin):
         return sanitized.strip().replace(" ", "_") or "export"
 
     def _product_xlsx_path(self, product_name: str) -> Path:
-        """Full path for a product workbook: Product_name_date_time.xlsx."""
-        stamp = datetime.now().strftime(PROCESSED_RUN_DIR_FORMAT)
+        """Full path for a product workbook, e.g. OVIDREL.xlsx."""
         product = self._sanitize_filename_part(product_name)
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        return self.download_dir / f"{product}_{stamp}.xlsx"
+        return self.download_dir / f"{product}.xlsx"
 
     def _find_new_download_file(
         self, before: dict[str, float], *, min_bytes: int = MIN_XLSX_BYTES
@@ -486,19 +485,21 @@ class IqviaBot(IqviaSessionAuthMixin):
         if suffix not in EXCEL_EXTENSIONS and suffix != ".zip":
             raise RuntimeError(f"Unexpected download type: {temp_destination.name}")
 
-        processed = self._validate_and_postprocess_xlsx(
-            temp_destination,
-            product_name,
-        )
-        source_stem = temp_destination.stem
-
+        raw_stem = temp_destination.stem
+        raw_name = temp_destination.name
         if temp_destination != final_xlsx:
             if final_xlsx.exists():
                 final_xlsx.unlink()
             shutil.move(temp_destination, final_xlsx)
+            logger.info("Renamed IQVIA export %r → %s", raw_name, final_xlsx.name)
+
+        processed = self._validate_and_postprocess_xlsx(
+            final_xlsx,
+            product_name,
+        )
 
         final_csv = table1_csv_path_for(final_xlsx, product=product_name)
-        src_csv = temp_destination.parent / f"{source_stem}.csv"
+        src_csv = final_xlsx.parent / f"{raw_stem}.csv"
         if src_csv.is_file() and src_csv != final_csv:
             if final_csv.exists():
                 final_csv.unlink()
