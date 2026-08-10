@@ -6479,7 +6479,22 @@ class CreateReportPage:
                 )
 
         page = frame.page
+        drop_anchor_label = (
+            drop_zone_text
+            if drop_zone_text != self.measure_drop_zone_text
+            else None
+        )
         for attempt in range(1, 5):
+            if drop_anchor_label and attempt > 1:
+                refreshed = self._wait_for_pivot_measure_row(
+                    frame, drop_anchor_label, timeout_ms=3_000
+                )
+                if refreshed is None:
+                    refreshed = self._resolve_pivot_field_locator(
+                        frame, drop_anchor_label
+                    )
+                if refreshed is not None:
+                    drop_loc = refreshed
             logger.info(
                 "Dragging %r → %r (attempt %d)…",
                 item_label,
@@ -6499,10 +6514,30 @@ class CreateReportPage:
                     "drag_to failed for %r — using manual click-drag-release",
                     item_label,
                 )
-                start = self._locator_page_point(
-                    source_loc, x_ratio=0.32, y_ratio=0.5
-                )
-                end = self._locator_page_point(drop_loc, x_ratio=0.5, y_ratio=0.5)
+                try:
+                    start = self._locator_page_point(
+                        source_loc, x_ratio=0.32, y_ratio=0.5
+                    )
+                    end = self._locator_page_point(
+                        drop_loc, x_ratio=0.5, y_ratio=0.5
+                    )
+                except PlaywrightError:
+                    if drop_anchor_label:
+                        refreshed = self._resolve_pivot_field_locator(
+                            frame, drop_anchor_label
+                        )
+                        if refreshed is not None:
+                            drop_loc = refreshed
+                            start = self._locator_page_point(
+                                source_loc, x_ratio=0.32, y_ratio=0.5
+                            )
+                            end = self._locator_page_point(
+                                drop_loc, x_ratio=0.5, y_ratio=0.5
+                            )
+                        else:
+                            raise
+                    else:
+                        raise
                 if not start or not end:
                     raise PlaywrightTimeoutError(
                         f"Could not read drag coordinates for {item_label!r}"
@@ -6519,10 +6554,28 @@ class CreateReportPage:
                 "drag_to did not verify for %r — retrying with mouse drag",
                 item_label,
             )
-            start = self._locator_page_point(
-                source_loc, x_ratio=0.32, y_ratio=0.5
-            )
-            end = self._locator_page_point(drop_loc, x_ratio=0.5, y_ratio=0.5)
+            try:
+                start = self._locator_page_point(
+                    source_loc, x_ratio=0.32, y_ratio=0.5
+                )
+                end = self._locator_page_point(drop_loc, x_ratio=0.5, y_ratio=0.5)
+            except PlaywrightError:
+                if drop_anchor_label:
+                    refreshed = self._resolve_pivot_field_locator(
+                        frame, drop_anchor_label
+                    )
+                    if refreshed is not None:
+                        drop_loc = refreshed
+                        start = self._locator_page_point(
+                            source_loc, x_ratio=0.32, y_ratio=0.5
+                        )
+                        end = self._locator_page_point(
+                            drop_loc, x_ratio=0.5, y_ratio=0.5
+                        )
+                    else:
+                        start = end = None
+                else:
+                    start = end = None
             if start and end:
                 self._human_mouse_drag(page, start, end)
             if self._poll_until_ui(frame, verify, idle_timeout_ms=5_000):
@@ -8397,23 +8450,48 @@ class CreateReportPage:
                 """
                 () => {
                     const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const readSelect = (sel) => {
+                        if (!sel) return '';
+                        if (sel.selectedIndex >= 0) {
+                            const opt = sel.options[sel.selectedIndex];
+                            return trim(opt.textContent) || trim(opt.value);
+                        }
+                        return trim(sel.value);
+                    };
                     for (const label of document.querySelectorAll(
                         'td, label, span, div'
                     )) {
                         const t = trim(label.textContent);
-                        if (t !== 'Based on Measure' && t !== 'Based on Measure:') {
+                        if (
+                            t !== 'Based on Measure'
+                            && t !== 'Based on Measure:'
+                            && !t.startsWith('Based on Measure')
+                        ) {
                             continue;
                         }
                         const row = label.closest('tr') || label.parentElement;
                         if (!row) continue;
                         const sel = row.querySelector('select');
-                        if (sel && sel.selectedIndex >= 0) {
-                            return trim(sel.options[sel.selectedIndex].textContent);
-                        }
+                        const picked = readSelect(sel);
+                        if (picked) return picked;
                         const input = row.querySelector(
                             'input.rcbInput, input[type="text"]'
                         );
                         if (input) return trim(input.value);
+                    }
+                    for (const sel of document.querySelectorAll('select')) {
+                        const opts = [...sel.options];
+                        const names = opts.flatMap((o) => [
+                            trim(o.textContent),
+                            trim(o.value),
+                        ]);
+                        if (
+                            names.some((n) => n === 'Units')
+                            && names.some((n) => n === 'Values')
+                        ) {
+                            const picked = readSelect(sel);
+                            if (picked) return picked;
+                        }
                     }
                     for (const inp of document.querySelectorAll('input.rcbInput')) {
                         const v = trim(inp.value);
@@ -9065,6 +9143,84 @@ class CreateReportPage:
                 return True
         return False
 
+    def _set_based_on_measure_row_select(self, scope, measure: str) -> bool:
+        """Set Based on Measure via the dialog row <select> (Units / Values)."""
+        picked = scope.evaluate(
+            """
+            (measureName) => {
+                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const matchName = (opt, name) => {
+                    const text = trim(opt.textContent);
+                    const val = trim(opt.value);
+                    const lower = name.toLowerCase();
+                    return (
+                        text === name
+                        || val === name
+                        || text.toLowerCase() === lower
+                        || val.toLowerCase() === lower
+                    );
+                };
+                const applySelect = (sel) => {
+                    for (const opt of sel.options) {
+                        if (!matchName(opt, measureName)) continue;
+                        sel.selectedIndex = opt.index;
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        sel.dispatchEvent(new Event('input', { bubbles: true }));
+                        sel.dispatchEvent(new Event('blur', { bubbles: true }));
+                        return trim(opt.textContent) || trim(opt.value);
+                    }
+                    return null;
+                };
+                const isMeasureSelect = (sel) => {
+                    const names = [...sel.options].flatMap((o) => [
+                        trim(o.textContent),
+                        trim(o.value),
+                    ]);
+                    return (
+                        names.some((n) => n === 'Units')
+                        && names.some((n) => n === 'Values')
+                    );
+                };
+
+                for (const label of document.querySelectorAll(
+                    'td, label, span, div'
+                )) {
+                    const t = trim(label.textContent);
+                    if (
+                        t !== 'Based on Measure'
+                        && t !== 'Based on Measure:'
+                        && !t.startsWith('Based on Measure')
+                    ) {
+                        continue;
+                    }
+                    const row = label.closest('tr') || label.parentElement;
+                    if (!row) continue;
+                    const sel = row.querySelector('select');
+                    if (sel) {
+                        const picked = applySelect(sel);
+                        if (picked) return picked;
+                    }
+                }
+
+                for (const sel of document.querySelectorAll('select')) {
+                    if (!isMeasureSelect(sel)) continue;
+                    const picked = applySelect(sel);
+                    if (picked) return picked;
+                }
+                return null;
+            }
+            """,
+            measure,
+        )
+        if picked:
+            logger.info(
+                "Set Based on Measure to %r (Based on Measure row select)",
+                picked,
+            )
+            return True
+        return False
+
     def _set_measure_on_customize_scope(self, scope, measure: str) -> None:
         """Set Based on Measure on a verified Customize Filter scope."""
         measure = measure.strip()
@@ -9073,23 +9229,44 @@ class CreateReportPage:
             logger.info("Based on Measure already %r", current or measure)
             return
 
+        if self._set_based_on_measure_row_select(scope, measure):
+            if self._measure_selection_matches(scope, measure):
+                return
+
         picked = scope.evaluate(
             """
             (measureName) => {
                 const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const matchName = (opt, name) => {
+                    const text = trim(opt.textContent);
+                    const val = trim(opt.value);
+                    const lower = name.toLowerCase();
+                    return (
+                        text === name
+                        || val === name
+                        || text.toLowerCase() === lower
+                        || val.toLowerCase() === lower
+                    );
+                };
                 for (const sel of document.querySelectorAll('select')) {
-                    const opts = [...sel.options].map((o) => trim(o.textContent));
-                    if (!opts.includes('Units') || !opts.includes('Values')) continue;
-                    for (const opt of sel.options) {
-                        const text = trim(opt.textContent);
-                        if (text !== measureName && !text.includes(measureName)) {
-                            continue;
-                        }
-                        sel.value = opt.value;
+                    const opts = [...sel.options];
+                    const names = opts.flatMap((o) => [
+                        trim(o.textContent),
+                        trim(o.value),
+                    ]);
+                    if (
+                        !names.some((n) => n === 'Units')
+                        || !names.some((n) => n === 'Values')
+                    ) {
+                        continue;
+                    }
+                    for (const opt of opts) {
+                        if (!matchName(opt, measureName)) continue;
                         sel.selectedIndex = opt.index;
+                        sel.value = opt.value;
                         sel.dispatchEvent(new Event('change', { bubbles: true }));
                         sel.dispatchEvent(new Event('blur', { bubbles: true }));
-                        return text;
+                        return trim(opt.textContent) || trim(opt.value);
                     }
                 }
                 return null;
@@ -9101,8 +9278,12 @@ class CreateReportPage:
             logger.info(
                 "Set Based on Measure to %r (Units/Values select JS)", picked
             )
-            return
+            if self._measure_selection_matches(scope, measure):
+                return
 
+        if self._set_customize_measure_via_select(scope, measure):
+            if self._measure_selection_matches(scope, measure):
+                return
         if self._select_customize_measure_native_select(scope, measure):
             if self._measure_selection_matches(scope, measure):
                 return
@@ -9115,17 +9296,15 @@ class CreateReportPage:
                 return
         if self._select_measure_from_units_combobox(scope, measure):
             return
-        if self._set_customize_measure_via_select(scope, measure):
-            logger.info("Set Based on Measure to %r (hidden select)", measure)
-            return
+        if self._force_set_measure_on_any_select(measure):
+            if self._measure_selection_matches(scope, measure):
+                return
 
         try:
             self._set_customize_filter_based_on_measure(measure)
             return
         except PlaywrightTimeoutError:
             pass
-        if self._force_set_measure_on_any_select(measure):
-            return
 
         raise PlaywrightTimeoutError(
             f"Could not set Based on Measure to {measure!r} in "
@@ -14056,6 +14235,19 @@ class CreateReportPage:
         First measure → 'Drop a Measure Here'.
         After that the placeholder is replaced — drop onto the existing measure row.
         """
+        if anchor_measure:
+            anchor_loc = self._wait_for_pivot_measure_row(
+                frame, anchor_measure, timeout_ms=8_000
+            )
+            if anchor_loc is None:
+                anchor_loc = self._resolve_pivot_field_locator(frame, anchor_measure)
+            if anchor_loc is not None:
+                logger.info(
+                    "Dropping onto existing %r in pivot",
+                    anchor_measure,
+                )
+                return anchor_loc, anchor_measure
+
         placeholder = frame.get_by_text(self.measure_drop_zone_text, exact=False)
         try:
             if placeholder.count() > 0 and placeholder.first.is_visible(timeout=500):
@@ -15927,14 +16119,21 @@ class CreateReportPage:
 
         self._scroll_schema_label_into_view(frame, self.values_item)
         values_source = self._sales_data_item_locator(frame, self.values_item)
-        values_drop_loc, values_drop_label = self._find_measure_drop_target(
-            frame, anchor_measure=self.units_item
+        units_drop_loc = self._wait_for_pivot_measure_row(
+            frame, self.units_item, timeout_ms=15_000
         )
+        if units_drop_loc is None:
+            units_drop_loc = self._resolve_pivot_field_locator(frame, self.units_item)
+        if units_drop_loc is None:
+            raise PlaywrightTimeoutError(
+                f"Could not find pivot row {self.units_item!r} to nest "
+                f"{self.values_item!r}"
+            )
         self._drag_tree_label_to_drop_zone(
             frame,
             self.values_item,
-            values_drop_label,
-            drop_loc=values_drop_loc,
+            self.units_item,
+            drop_loc=units_drop_loc,
             deepest=False,
             below_label=self.sales_data_folder,
             grandparent_label=self.measures_folder,
