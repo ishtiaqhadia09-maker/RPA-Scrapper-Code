@@ -17,7 +17,6 @@ import argparse
 import logging
 import shutil
 import time
-from datetime import datetime
 from pathlib import Path
 
 from apps.core.paths import DEFAULT_IQVIA_DOWNLOAD_DIR, ensure_data_dirs
