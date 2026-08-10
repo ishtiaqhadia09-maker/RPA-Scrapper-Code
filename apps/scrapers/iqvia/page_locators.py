@@ -157,7 +157,25 @@ class LoginPage:
         self.setPassword(password)
         logger.info("Submitting login…")
         self.clickSubmit()
-        self.page.wait_for_load_state("domcontentloaded")
+        # Wait for the post-submit navigation to start and settle.
+        # wait_for_load_state alone can return immediately when called before the
+        # navigation has started, so we first wait for the URL/title to change
+        # away from the password page, giving the auth server up to 60 s to respond.
+        try:
+            self.page.wait_for_function(
+                "() => !document.location.href.includes('/account/password')",
+                timeout=60_000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=60_000)
+        except PlaywrightTimeoutError:
+            pass
+        logger.info("Post-submit page: %r", self.page.title())
+
+        if self.page.title() == self.DECISION_CENTER_TITLE:
+            return
 
         self._handle_verification(
             otp,
@@ -191,7 +209,9 @@ class LoginPage:
         allow_manual_otp: bool,
         guard: object | None,
     ) -> None:
-        if not self._wait_for_verification_page(timeout_ms=20_000):
+        if self.page.title() == self.DECISION_CENTER_TITLE:
+            return
+        if not self._wait_for_verification_page(timeout_ms=60_000):
             return
 
         if otp.strip():
@@ -2844,10 +2864,14 @@ class CreateReportPage:
                     return true;
                 };
 
+                const root = document.getElementById('trvSchema')
+                    || document.querySelector('[id*="trvSchema"]')
+                    || document.body;
+
                 let anchorRect = null;
                 if (requireBelow) {
                     let maxLeft = -1;
-                    for (const el of document.body.querySelectorAll(
+                    for (const el of root.querySelectorAll(
                         'span, a, td, div, label, li'
                     )) {
                         const text = trim(el.textContent);
@@ -2864,7 +2888,7 @@ class CreateReportPage:
                 let belowRect = null;
                 if (belowLabel) {
                     let maxLeft = -1;
-                    for (const el of document.body.querySelectorAll(
+                    for (const el of root.querySelectorAll(
                         'span, a, td, div, label, li'
                     )) {
                         const text = trim(el.textContent);
@@ -2880,7 +2904,7 @@ class CreateReportPage:
                 }
 
                 const hits = [];
-                for (const el of document.body.querySelectorAll(
+                for (const el of root.querySelectorAll(
                     'span, a, td, div, label, li'
                 )) {
                     const text = trim(el.textContent);
@@ -2908,7 +2932,7 @@ class CreateReportPage:
                 const rowY = rowRect.top + rowRect.height / 2;
                 const rowTol = Math.max(rowRect.height * 0.65, 10);
 
-                for (const el of document.body.querySelectorAll('*')) {
+                for (const el of root.querySelectorAll('*')) {
                     const t = trim(el.textContent);
                     if (t !== '>' && t !== '▶' && t !== '›') continue;
                     if (!isVisible(el)) continue;
@@ -2921,6 +2945,15 @@ class CreateReportPage:
                 }
 
                 if (row) {
+                    for (const el of row.querySelectorAll(
+                        '.rtPlus, .rtMinus, [class*="rtPlus"], [class*="rtMinus"]'
+                    )) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 && r.height <= 0) continue;
+                        if (fireClick(el)) {
+                            return { ok: true, method: 'rtPlus' };
+                        }
+                    }
                     for (const img of row.querySelectorAll('img')) {
                         const r = img.getBoundingClientRect();
                         if (r.width <= 0 || r.height <= 0) continue;
@@ -3088,7 +3121,20 @@ class CreateReportPage:
         require_below: str | None = None,
         grandparent_label: str | None = None,
     ) -> bool:
-        """Expand a schema tree row — JS chevron, coords, then offset fallback."""
+        """Expand a schema tree row — schema chevron, JS, coords, then offset."""
+        self._scroll_schema_label_into_view(frame, label)
+
+        if self._click_schema_tree_chevron(
+            frame,
+            label,
+            below_label=below_label,
+            require_below=require_below or grandparent_label,
+            deepest=deepest,
+        ):
+            if self._poll_until_ui(frame, verify, idle_timeout_ms=2_000):
+                logger.info("Clicked %r chevron via schema tree (JS)", label)
+                return True
+
         if grandparent_label and below_label:
             target = self._resolve_tree_label_locator(
                 frame,
@@ -3161,12 +3207,15 @@ class CreateReportPage:
                     const r = el.getBoundingClientRect();
                     return r.width > 0 && r.height > 0;
                 };
+                const root = document.getElementById('trvSchema')
+                    || document.querySelector('[id*="trvSchema"]')
+                    || document.body;
 
                 let belowRect = null;
                 if (belowLabel) {
                     let maxLeft = -1;
-                    for (const el of document.body.querySelectorAll(
-                        'span, a, td, div, label, li'
+                    for (const el of root.querySelectorAll(
+                        'span, a, td, div, label, li, nobr'
                     )) {
                         const text = trim(el.textContent);
                         if (text !== belowLabel || text.includes('Loading')) continue;
@@ -3181,8 +3230,8 @@ class CreateReportPage:
                 }
 
                 const labelHits = [];
-                for (const el of document.body.querySelectorAll(
-                    'span, a, td, div, label, li'
+                for (const el of root.querySelectorAll(
+                    'span, a, td, div, label, li, nobr'
                 )) {
                     const text = trim(el.textContent);
                     if (text !== label || text.includes('Loading')) continue;
@@ -3190,7 +3239,8 @@ class CreateReportPage:
                     const r = el.getBoundingClientRect();
                     if (belowRect) {
                         if (r.top <= belowRect.top + 4) continue;
-                        if (Math.abs(r.left - belowRect.left) > 64) continue;
+                        if (r.left < belowRect.left - 8) continue;
+                        if (r.left - belowRect.left > 96) continue;
                     }
                     labelHits.push({ el, left: r.left, r });
                 }
@@ -3224,6 +3274,18 @@ class CreateReportPage:
                     'tr, li, [class*="Node"], [class*="rtLI"], [class*="Tree"]'
                 ) || labelHit.el.parentElement;
                 if (row) {
+                    for (const el of row.querySelectorAll(
+                        '.rtPlus, .rtMinus, [class*="rtPlus"], [class*="rtMinus"]'
+                    )) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 && r.height <= 0) continue;
+                        return {
+                            ok: true,
+                            x: r.left + Math.max(r.width, 8) / 2,
+                            y: rowY,
+                            method: 'rtPlus',
+                        };
+                    }
                     for (const el of row.querySelectorAll('img, svg, span, i')) {
                         if (!isVisible(el)) continue;
                         const r = el.getBoundingClientRect();
@@ -5711,36 +5773,11 @@ class CreateReportPage:
 
     def _click_period_chevron_in_schema(self, frame) -> bool:
         """Click the expand control on Period inside trvSchema only."""
-        return frame.evaluate(
-            """
-            () => {
-                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                const root = document.getElementById('trvSchema')
-                    || document.querySelector('[id*="trvSchema"]');
-                if (!root) return false;
-                const fire = (el) => {
-                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
-                    el.click();
-                    return true;
-                };
-                for (const el of root.querySelectorAll(
-                    'span, td, div, label, a, nobr'
-                )) {
-                    if (trim(el.textContent) !== 'Period') continue;
-                    const row = el.closest('tr, li, div') || el.parentElement;
-                    if (!row) continue;
-                    for (const img of row.querySelectorAll('img')) {
-                        const r = img.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) return fire(img);
-                    }
-                    for (const ch of row.querySelectorAll('span, i')) {
-                        const t = trim(ch.textContent);
-                        if (t === '>' || t === '▶' || t === '›') return fire(ch);
-                    }
-                }
-                return false;
-            }
-            """
+        return self._click_schema_tree_chevron(
+            frame,
+            self.period_item,
+            require_below=self.dimensions_folder,
+            deepest=False,
         )
 
     def _period_label_boxes(self, frame) -> list[dict]:
@@ -13991,6 +14028,173 @@ class CreateReportPage:
             )
         logger.info("Verified %r in measure zone", item_label)
 
+    def _scroll_schema_label_into_view(self, frame, label: str) -> None:
+        """Scroll the #trvSchema container so that label is centred in the panel.
+
+        Playwright's scroll_into_view_if_needed scrolls the outer browser frame
+        rather than the tree's own inner scrollbar.  We drive it from JS so the
+        scroll happens inside the trvSchema container even when the target node
+        is currently outside the visible clip area (getBoundingClientRect may
+        return zero size for clipped-overflow elements, so we do NOT guard on
+        visibility here).
+        """
+        frame.evaluate(
+            """
+            (label) => {
+                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const root = document.getElementById('trvSchema')
+                    || document.querySelector('[id*="trvSchema"]')
+                    || document.body;
+                // Period expansion can push the tree horizontally — reset so
+                // chevrons to the left of labels are reachable again.
+                let host = root;
+                for (let i = 0; i < 6 && host; i++) {
+                    if (host.scrollWidth > host.clientWidth + 2) {
+                        host.scrollLeft = 0;
+                    }
+                    host = host.parentElement;
+                }
+                for (const el of root.querySelectorAll(
+                    'span, a, td, div, label, li, nobr'
+                )) {
+                    if (trim(el.textContent) !== label) continue;
+                    el.scrollIntoView({ block: 'center', inline: 'start' });
+                    return;
+                }
+            }
+            """,
+            label,
+        )
+
+    def _click_schema_tree_chevron(
+        self,
+        frame,
+        label: str,
+        *,
+        below_label: str | None = None,
+        require_below: str | None = None,
+        deepest: bool = True,
+    ) -> bool:
+        """Click expand/collapse chevron for a row inside #trvSchema only."""
+        return frame.evaluate(
+            """
+            ([label, belowLabel, requireBelow, deepest]) => {
+                const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const root = document.getElementById('trvSchema')
+                    || document.querySelector('[id*="trvSchema"]');
+                if (!root) return false;
+
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const fire = (el) => {
+                    if (!el) return false;
+                    el.scrollIntoView({ block: 'center', inline: 'start' });
+                    for (const type of ['mousedown', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {
+                            bubbles: true, cancelable: true, view: window,
+                        }));
+                    }
+                    if (typeof el.click === 'function') el.click();
+                    return true;
+                };
+
+                let anchorRect = null;
+                if (requireBelow) {
+                    let maxLeft = -1;
+                    for (const el of root.querySelectorAll(
+                        'span, a, td, div, label, li, nobr'
+                    )) {
+                        const text = trim(el.textContent);
+                        if (text !== requireBelow) continue;
+                        const r = el.getBoundingClientRect();
+                        if (!isVisible(el)) continue;
+                        if (r.left > maxLeft) {
+                            maxLeft = r.left;
+                            anchorRect = r;
+                        }
+                    }
+                }
+
+                let belowRect = null;
+                if (belowLabel) {
+                    let maxLeft = -1;
+                    for (const el of root.querySelectorAll(
+                        'span, a, td, div, label, li, nobr'
+                    )) {
+                        const text = trim(el.textContent);
+                        if (text !== belowLabel) continue;
+                        const r = el.getBoundingClientRect();
+                        if (!isVisible(el)) continue;
+                        if (r.left > maxLeft) {
+                            maxLeft = r.left;
+                            belowRect = r;
+                        }
+                    }
+                }
+
+                const hits = [];
+                for (const el of root.querySelectorAll(
+                    'span, a, td, div, label, li, nobr'
+                )) {
+                    const text = trim(el.textContent);
+                    if (text !== label) continue;
+                    const r = el.getBoundingClientRect();
+                    if (anchorRect && r.top <= anchorRect.top + 4) continue;
+                    if (belowRect) {
+                        if (r.top <= belowRect.top + 4) continue;
+                        if (r.left < belowRect.left - 8) continue;
+                        if (r.left - belowRect.left > 96) continue;
+                    }
+                    hits.push({ el, left: r.left, r });
+                }
+                if (!hits.length) return false;
+                hits.sort((a, b) =>
+                    deepest ? b.left - a.left : a.left - b.left
+                );
+                const labelEl = hits[0].el;
+                const labelRect = hits[0].r;
+                labelEl.scrollIntoView({ block: 'center', inline: 'start' });
+                const row = labelEl.closest(
+                    'tr, li, [class*="rtLI"], [class*="Node"], '
+                    + '[class*="node"], [class*="Tree"]'
+                ) || labelEl.parentElement;
+
+                const tryContainer = (container) => {
+                    if (!container) return false;
+                    for (const el of container.querySelectorAll(
+                        '.rtPlus, .rtMinus, [class*="rtPlus"], [class*="rtMinus"]'
+                    )) {
+                        if (fire(el)) return true;
+                    }
+                    for (const img of container.querySelectorAll('img')) {
+                        const r = img.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        if (r.left >= labelRect.left) continue;
+                        if (fire(img)) return true;
+                    }
+                    for (const ch of container.querySelectorAll('span, i')) {
+                        const t = trim(ch.textContent);
+                        if (t === '>' || t === '▶' || t === '›' || t === '▼') {
+                            if (fire(ch)) return true;
+                        }
+                    }
+                    return false;
+                };
+
+                if (tryContainer(row)) return true;
+                let parent = labelEl.parentElement;
+                for (let i = 0; i < 4 && parent; i++) {
+                    if (tryContainer(parent)) return true;
+                    parent = parent.parentElement;
+                }
+                return false;
+            }
+            """,
+            [label, below_label, require_below, deepest],
+        )
+
     def expand_sales_data_folder(self) -> None:
         """Expand Measures (if needed) then Sales Data via row chevrons."""
         frame = self._designer_frame()
@@ -14001,6 +14205,9 @@ class CreateReportPage:
 
         if not self._is_tree_node_visible(frame, self.sales_data_folder):
             logger.info("Clicking %r chevron…", self.measures_folder)
+            # Scroll Measures into view before clicking its chevron so the tree
+            # panel is positioned correctly even when Period is still expanded.
+            self._scroll_schema_label_into_view(frame, self.measures_folder)
             measures_visible = lambda: self._is_tree_node_visible(
                 frame, self.sales_data_folder
             )
@@ -14018,6 +14225,12 @@ class CreateReportPage:
         if self._sales_data_children_visible(frame):
             logger.info("%r already expanded", self.sales_data_folder)
             return
+
+        # Scroll Sales Data into the visible area of the schema tree panel
+        # before attempting the chevron click. When Period is still expanded its
+        # many children push Sales Data below the visible scroll area, making all
+        # coordinate-based chevron clicks land on the wrong element.
+        self._scroll_schema_label_into_view(frame, self.sales_data_folder)
 
         logger.info(
             "Clicking %r chevron under %r…",
@@ -14063,6 +14276,22 @@ class CreateReportPage:
             self.period_item,
             self.market_dimension,
         )
+        # Tree is locked while a query is running — wait for idle first.
+        self._wait_for_query_idle(frame, timeout_ms=60_000)
+        self._scroll_schema_label_into_view(frame, self.period_item)
+
+        collapsed = lambda: not self._period_children_visible(frame)
+        if self._click_schema_tree_chevron(
+            frame,
+            self.period_item,
+            require_below=self.dimensions_folder,
+            deepest=False,
+        ) and self._poll_until_ui(
+            frame, collapsed, idle_timeout_ms=600, busy_timeout_ms=3_000
+        ):
+            logger.info("%r collapsed", self.period_item)
+            return
+
         period_target = self._dimension_anchor_locator(frame, self.period_item)
         if period_target is None:
             return
@@ -14075,9 +14304,16 @@ class CreateReportPage:
             frame,
             period_box,
             self.period_item,
-            verify=lambda: not self._period_children_visible(frame),
+            verify=collapsed,
+            idle_timeout_ms=600,
+            busy_timeout_ms=3_000,
         ):
             logger.info("%r collapsed", self.period_item)
+        else:
+            logger.info(
+                "%r collapse skipped — continuing anyway",
+                self.period_item,
+            )
 
     def collapse_market_if_expanded(self, frame) -> None:
         """Close Market so its Attributes row is not confused with Product's."""
@@ -14153,6 +14389,52 @@ class CreateReportPage:
                 "%r collapse skipped — continuing with %r",
                 self.product_dimension,
                 self.geography_dimension,
+            )
+
+    def _hierarchies_children_visible(self, frame) -> bool:
+        """Return True when the Hierarchies folder is open (its items are shown)."""
+        try:
+            return frame.get_by_text(
+                self.relative_mat_item, exact=False
+            ).first.is_visible(timeout=300)
+        except PlaywrightTimeoutError:
+            return False
+
+    def collapse_hierarchies_if_expanded(self, frame) -> None:
+        """Close the Hierarchies sub-folder under Period to clean up the tree."""
+        if not self._hierarchies_children_visible(frame):
+            return
+
+        logger.info(
+            "Closing %r before next step…",
+            self.hierarchies_folder,
+        )
+        hier_target = self._resolve_tree_label_locator(
+            frame,
+            self.hierarchies_folder,
+            deepest=True,
+            below_label=self.period_item,
+        )
+        if hier_target is None:
+            return
+        hier_target.scroll_into_view_if_needed()
+        hier_box = hier_target.bounding_box()
+        if not hier_box:
+            return
+
+        if self._click_chevron_for_label_box(
+            frame,
+            hier_box,
+            self.hierarchies_folder,
+            verify=lambda: not self._hierarchies_children_visible(frame),
+            idle_timeout_ms=600,
+            busy_timeout_ms=3_000,
+        ):
+            logger.info("%r collapsed", self.hierarchies_folder)
+        else:
+            logger.info(
+                "%r collapse skipped — continuing anyway",
+                self.hierarchies_folder,
             )
 
     def _is_dimension_expanded(self, frame, dimension: str) -> bool:
@@ -15482,6 +15764,10 @@ class CreateReportPage:
             deepest=True,
             below_label=self.hierarchies_folder,
         )
+
+        # Collapse Period (and its Hierarchies child with it) so the tree is
+        # clean for the next step.
+        self.collapse_period_if_expanded(frame)
 
     def open_sales_data_and_drag_units_values_to_measures(self) -> None:
         """Sales Data → drag Units to measures, then Values onto the Units row."""
