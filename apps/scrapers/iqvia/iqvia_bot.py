@@ -390,15 +390,70 @@ class IqviaBot(IqviaSessionAuthMixin):
             "Waiting for browser download to finish (%s)…",
             suggested_name,
         )
-        before = self._snapshot_download_dirs()
-        temp_destination = self.download_dir / suggested_name
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        temp_destination = self.download_dir / suggested_name
+        call_time = time.time()
+
+        # Browser.setDownloadBehavior (CDP) makes Chrome save the file directly
+        # to download_dir before Playwright can act.  Calling save_as() on a
+        # CDP-handled download immediately overwrites the real file with 0 bytes
+        # (Playwright's internal artifact is empty because CDP bypassed it).
+        #
+        # Strategy: poll until the CDP file appears and its size has been stable
+        # for several seconds (indicating the write is complete), then skip
+        # save_as entirely.  Only fall back to save_as when CDP never writes the
+        # file within the allowed window.
+        deadline = time.time() + DOWNLOAD_TIMEOUT_MS / 1000
+        last_sz = -1
+        stable_ticks = 0
+        STABLE_NEEDED = 3   # 3 × 2 s of unchanging non-zero size = done
+        POLL_SLEEP = 2.0
+
+        while time.time() < deadline:
+            if temp_destination.is_file():
+                stat = temp_destination.stat()
+                sz = stat.st_size
+                # Only accept files written by the current download (mtime within
+                # 5 min before this call) to avoid picking up stale leftovers.
+                if sz > 0 and stat.st_mtime >= call_time - 300:
+                    if sz == last_sz:
+                        stable_ticks += 1
+                        if stable_ticks >= STABLE_NEEDED:
+                            logger.info(
+                                "CDP download stable: %s (%d bytes)",
+                                suggested_name,
+                                sz,
+                            )
+                            break
+                    else:
+                        last_sz = sz
+                        stable_ticks = 0
+                        logger.info(
+                            "CDP download in progress: %s (%d bytes so far)",
+                            suggested_name,
+                            sz,
+                        )
+            time.sleep(POLL_SLEEP)
+
+        if temp_destination.is_file() and temp_destination.stat().st_size > 0:
+            logger.info(
+                "Download saved — %s (%d bytes). Running post-process…",
+                temp_destination.name,
+                temp_destination.stat().st_size,
+            )
+            return self._finalize_product_download(temp_destination, product_name)
+
+        # CDP file never appeared — fall back to Playwright's save_as
+        logger.warning(
+            "CDP file not found after polling; falling back to save_as for %s",
+            suggested_name,
+        )
+        before = self._snapshot_download_dirs()
         try:
             download.save_as(temp_destination)
         except Exception as exc:
-            # Some IQVIA exports trigger a download but Playwright's artifact may get
-            # canceled (tab closes / navigation). Fall back to polling folders for
-            # the freshly created file.
+            # Playwright's artifact may be canceled when the tab closes / CDP
+            # handles it.  Poll download folders for the freshly created file.
             logger.warning("Download save_as failed (%s) — polling folders", exc)
             found = self._find_new_download_file(before)
             if found:
@@ -409,6 +464,7 @@ class IqviaBot(IqviaSessionAuthMixin):
                 temp_destination = found
             else:
                 raise
+
         logger.info(
             "Download saved — %s (%d bytes). Running post-process…",
             temp_destination.name,

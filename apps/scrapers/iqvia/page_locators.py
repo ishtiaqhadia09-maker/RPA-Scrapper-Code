@@ -2,7 +2,7 @@ import logging
 import re
 import time
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 from apps.scrapers.iqvia.config import (
     COLUMN_EXPAND_PAUSE_MS,
@@ -6404,7 +6404,7 @@ class CreateReportPage:
         if drop_loc is None:
             drop_loc = frame.get_by_text(drop_zone_text, exact=False).first
             drop_loc.wait_for(state="visible", timeout=15_000)
-        source_loc.scroll_into_view_if_needed()
+        self._scroll_schema_label_into_view(frame, item_label)
         drop_loc.scroll_into_view_if_needed()
         self._settle(frame)
 
@@ -13822,7 +13822,7 @@ class CreateReportPage:
                 f"(similar: {hints})"
             ) from None
 
-        source_loc.scroll_into_view_if_needed()
+        self._scroll_schema_label_into_view(frame, item)
         self._settle(frame)
 
         page = frame.page
@@ -13859,6 +13859,7 @@ class CreateReportPage:
                     f"Drop verification failed for {item!r} after {attempt} attempts"
                 )
             logger.info("Retrying %r drop onto right-side Units…", item)
+            self._scroll_schema_label_into_view(frame, item)
             refreshed = self._find_pivot_measure_units_coords(frame)
             if refreshed:
                 end = (refreshed["page_x"], refreshed["page_y"])
@@ -14268,6 +14269,19 @@ class CreateReportPage:
 
     def collapse_period_if_expanded(self, frame) -> None:
         """Close Period so its Attributes row is not confused with Market's."""
+        try:
+            self._collapse_period_if_expanded_inner(frame)
+        except PlaywrightError as exc:
+            # The designer iframe can be reloaded by a server-side report rebuild
+            # triggered by a drag.  When that happens any pending Playwright calls
+            # on the old frame throw TargetClosedError.  The collapse is cosmetic
+            # cleanup — the next step opens a fresh designer anyway, so log and
+            # continue rather than propagating.
+            logger.warning(
+                "collapse_period_if_expanded skipped — frame closed: %s", exc
+            )
+
+    def _collapse_period_if_expanded_inner(self, frame) -> None:
         if not self._period_children_visible(frame):
             return
 
@@ -15792,53 +15806,39 @@ class CreateReportPage:
         self._verify_measure_dropped(frame, self.units_item)
         self._wait_for_query_idle(frame)
 
-        units_coords = None
-
-        def _units_coords_ready() -> bool:
-            nonlocal units_coords
-            units_coords = self._find_pivot_measure_units_coords(frame)
-            return units_coords is not None
-
-        if not self._poll_until(frame, _units_coords_ready, timeout_ms=15_000):
-            logger.warning(
-                "Units row coords not found — dropping %r on measure zone",
-                self.values_item,
-            )
-            values_source = self._sales_data_item_locator(frame, self.values_item)
-            self._drag_tree_label_to_drop_zone(
-                frame,
-                self.values_item,
-                drop_label,
-                drop_loc=drop_loc,
-                deepest=False,
-                below_label=self.sales_data_folder,
-                grandparent_label=self.measures_folder,
-                source_loc=values_source,
-                verify=lambda: self._pivot_field_dropped(
+        self._scroll_schema_label_into_view(frame, self.values_item)
+        values_source = self._sales_data_item_locator(frame, self.values_item)
+        values_drop_loc, values_drop_label = self._find_measure_drop_target(
+            frame, anchor_measure=self.units_item
+        )
+        self._drag_tree_label_to_drop_zone(
+            frame,
+            self.values_item,
+            values_drop_label,
+            drop_loc=values_drop_loc,
+            deepest=False,
+            below_label=self.sales_data_folder,
+            grandparent_label=self.measures_folder,
+            source_loc=values_source,
+            verify=lambda: (
+                self._values_on_units_verified(frame)
+                or self._pivot_field_dropped(
                     frame, self.values_item, self.measure_drop_zone_text
-                ),
+                )
+            ),
+        )
+        if self._values_on_units_verified(frame):
+            logger.info(
+                "Verified %r nested on pivot %r row",
+                self.values_item,
+                self.units_item,
             )
+        else:
             self._verify_measure_dropped(frame, self.values_item)
             logger.info(
                 "Verified %r in measure zone (Values dropped beside Units)",
                 self.values_item,
             )
-            return
-
-        logger.info(
-            "Dragging %r from left tree onto right-side pivot %r at (%.0f, %.0f)…",
-            self.values_item,
-            self.units_item,
-            units_coords["page_x"],
-            units_coords["page_y"],
-        )
-        self._drag_sales_data_item_to_pivot_coords(
-            frame,
-            self.values_item,
-            units_coords,
-            verify=lambda: self._values_on_units_verified(frame),
-        )
-        self._verify_values_on_units(frame)
 
     def _find_right_pivot_row_drop_coords(self, frame) -> dict | None:
         """Click/drop point on 'Drop a Row Dimension Here' in the RIGHT pivot panel."""
