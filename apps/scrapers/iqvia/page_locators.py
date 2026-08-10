@@ -8136,10 +8136,13 @@ class CreateReportPage:
                 const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 let dialog = null;
                 let bestArea = Infinity;
-                for (const el of document.querySelectorAll('div, table')) {
+                for (const el of document.querySelectorAll(
+                    'div.rwWindow, div.rwDialog, div, table, form'
+                )) {
                     const text = el.textContent || '';
-                    if (!text.includes(dialogTitle)) continue;
-                    if (!text.includes('Based on Measure')) continue;
+                    const hasForm = text.includes('Based on Measure')
+                        || text.includes('Count Manner');
+                    if (!hasForm) continue;
                     const r = el.getBoundingClientRect();
                     if (r.width <= 0 || r.height <= 0) continue;
                     const area = r.width * r.height;
@@ -8820,38 +8823,37 @@ class CreateReportPage:
         poll_ms = 400
         elapsed = 0
         while elapsed < timeout_ms:
-            for scope in self._all_dialog_scopes():
+            for scope in self._walk_page_frames():
                 try:
                     info = scope.evaluate(
                         """
-                        ([dialogTitle]) => {
+                        () => {
                             const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                            for (const el of document.querySelectorAll(
-                                'div, table, form'
-                            )) {
-                                const text = el.textContent || '';
-                                if (!text.includes(dialogTitle)) continue;
-                                const r = el.getBoundingClientRect();
-                                if (r.width < 200 || r.height < 120) continue;
-                                for (const sel of el.querySelectorAll('select')) {
-                                    const opts = [...sel.options].map((o) =>
-                                        trim(o.textContent)
-                                    );
-                                    if (opts.includes('Units') && opts.includes('Values')) {
-                                        return { ready: true, opts };
-                                    }
+                            const body = document.body?.innerText || '';
+                            const hasForm = body.includes('Based on Measure')
+                                || body.includes('Count Manner');
+                            if (!hasForm) return { ready: false };
+
+                            for (const sel of document.querySelectorAll('select')) {
+                                const opts = [...sel.options].map((o) =>
+                                    trim(o.textContent)
+                                );
+                                if (opts.includes('Units') && opts.includes('Values')) {
+                                    return { ready: true, via: 'measure-select', opts };
                                 }
-                                for (const inp of el.querySelectorAll('input')) {
-                                    const v = trim(inp.value);
-                                    if (v === 'Units' || v === 'Values') {
-                                        return { ready: true, via: 'input', value: v };
-                                    }
+                            }
+                            for (const inp of document.querySelectorAll('input')) {
+                                const v = trim(inp.value);
+                                if (v === 'Units' || v === 'Values') {
+                                    return { ready: true, via: 'input', value: v };
                                 }
+                            }
+                            if (body.includes('Display Range') || body.includes('Count')) {
+                                return { ready: true, via: 'dialog-text' };
                             }
                             return { ready: false };
                         }
-                        """,
-                        [title],
+                        """
                     )
                     if info and info.get("ready"):
                         logger.info("Customize Filter form verified: %s", info)
@@ -8872,7 +8874,7 @@ class CreateReportPage:
         poll_ms = 200
         elapsed = 0
         while elapsed < timeout_ms:
-            for scope in self._all_dialog_scopes():
+            for scope in self._walk_page_frames():
                 try:
                     info = scope.evaluate(
                         """
@@ -9264,16 +9266,31 @@ class CreateReportPage:
 
     def _apply_customize_top_count(self, count: int) -> None:
         measure = self.custom_top_based_on_measure
-        dialog_scope = self._wait_for_real_customize_dialog(timeout_ms=45_000)
+        poll_ms = 400
+        deadline = time.time() + 60
+
+        # Form often loads in a nested iframe — try JS apply on every frame.
+        while time.time() < deadline:
+            for scope in self._walk_page_frames():
+                try:
+                    if self._apply_customize_filter_via_js(scope, count, measure):
+                        logger.info(
+                            "Customize Filter applied via JS (Count=%s, Measure=%r)",
+                            count,
+                            measure,
+                        )
+                        self._wait_for_query_idle(self._designer_frame())
+                        return
+                except Exception:
+                    continue
+            try:
+                self._designer_frame().wait_for_timeout(poll_ms)
+            except Exception:
+                self.page.wait_for_timeout(poll_ms)
+
+        dialog_scope = self._wait_for_real_customize_dialog(timeout_ms=15_000)
         scope_info = None
         if dialog_scope is None:
-            dialog_scope, scope_info = self._resolve_customize_filter_scope(
-                timeout_ms=30_000
-            )
-        if dialog_scope is None:
-            self._wait_for_dialog(
-                self.customize_filter_dialog_title, timeout_ms=8_000
-            )
             dialog_scope, scope_info = self._resolve_customize_filter_scope(
                 timeout_ms=15_000
             )
