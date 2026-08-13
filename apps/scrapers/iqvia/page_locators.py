@@ -130,6 +130,102 @@ class LoginPage:
     def setOtp(self, otp: str) -> None:
         self._fill_field(self.textbox_otp, otp)
 
+    def _login_state_snapshot(self) -> tuple[str, str]:
+        try:
+            title = self.page.title() or ""
+        except Exception:
+            title = ""
+        try:
+            url = self.page.url or ""
+        except Exception:
+            url = ""
+        return title, url
+
+    def _is_mid_auth_redirect(self, title: str | None = None, url: str | None = None) -> bool:
+        """True while Chromium shows Loading… or SAML ACS is still in flight."""
+        if title is None or url is None:
+            title, url = self._login_state_snapshot()
+        title_l = (title or "").strip().lower()
+        url_l = (url or "").lower()
+        if title_l.startswith("loading"):
+            return True
+        if "saml2/acs" in url_l and "hub.bi.iqvia.com" not in url_l:
+            return True
+        if "/account/password" in url_l:
+            return True
+        return False
+
+    def _post_password_destination_ready(self) -> bool:
+        title, url = self._login_state_snapshot()
+        if title == self.DECISION_CENTER_TITLE:
+            return True
+        if title == self.VERIFICATION_CODE_TITLE:
+            return True
+        if self.is_verification_page(timeout_ms=200):
+            return True
+        url_l = (url or "").lower()
+        if "hub.bi.iqvia.com" in url_l and "login.customerportal" not in url_l:
+            return True
+        if self._is_mid_auth_redirect(title, url):
+            return False
+        # Stable non-password portal page (error pages, consent, etc.)
+        if title and not title.lower().startswith("loading"):
+            if "/account/password" not in url_l:
+                return True
+        return False
+
+    def _wait_for_post_password_settled(self, timeout_sec: int = 120) -> None:
+        """Wait through SAML ACS / Loading… redirects after password submit."""
+        try:
+            self.page.wait_for_function(
+                "() => !document.location.href.includes('/account/password')",
+                timeout=60_000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        deadline_ms = timeout_sec * 1_000
+        poll_ms = 500
+        last_log = ""
+        for _ in range(max(1, deadline_ms // poll_ms)):
+            title, url = self._login_state_snapshot()
+            snap = f"{title}|{url}"
+            if snap != last_log:
+                logger.info(
+                    "Post-submit navigating… title=%r url=%s",
+                    title,
+                    (url or "")[:140],
+                )
+                last_log = snap
+            if self._post_password_destination_ready():
+                try:
+                    self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except PlaywrightTimeoutError:
+                    pass
+                return
+            try:
+                self.page.wait_for_timeout(poll_ms)
+            except Exception:
+                break
+
+        title, url = self._login_state_snapshot()
+        if self._is_mid_auth_redirect(title, url) or "hub.bi.iqvia.com" not in (
+            url or ""
+        ).lower():
+            logger.warning(
+                "Auth redirect still unsettled (title=%r) — opening Decision Center hub…",
+                title,
+            )
+            try:
+                self.page.goto(
+                    "https://hub.bi.iqvia.com/iam/",
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+                self.page.wait_for_load_state("domcontentloaded")
+            except Exception as exc:
+                logger.warning("Hub reload after SAML failed: %s", exc)
+
     def sign_in(
         self,
         username: str,
@@ -157,22 +253,12 @@ class LoginPage:
         self.setPassword(password)
         logger.info("Submitting login…")
         self.clickSubmit()
-        # Wait for the post-submit navigation to start and settle.
-        # wait_for_load_state alone can return immediately when called before the
-        # navigation has started, so we first wait for the URL/title to change
-        # away from the password page, giving the auth server up to 60 s to respond.
-        try:
-            self.page.wait_for_function(
-                "() => !document.location.href.includes('/account/password')",
-                timeout=60_000,
-            )
-        except PlaywrightTimeoutError:
-            pass
-        try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=60_000)
-        except PlaywrightTimeoutError:
-            pass
-        logger.info("Post-submit page: %r", self.page.title())
+        self._wait_for_post_password_settled(timeout_sec=120)
+        logger.info(
+            "Post-submit page: %r (%s)",
+            self.page.title(),
+            (self.page.url or "")[:120],
+        )
 
         if self.page.title() == self.DECISION_CENTER_TITLE:
             return
@@ -211,7 +297,13 @@ class LoginPage:
     ) -> None:
         if self.page.title() == self.DECISION_CENTER_TITLE:
             return
-        if not self._wait_for_verification_page(timeout_ms=60_000):
+        # Don't burn 60s waiting for OTP while still on SAML Loading… pages.
+        if self._is_mid_auth_redirect():
+            self._wait_for_post_password_settled(timeout_sec=90)
+        if self.page.title() == self.DECISION_CENTER_TITLE:
+            return
+        otp_wait_ms = 15_000 if not self._is_mid_auth_redirect() else 5_000
+        if not self._wait_for_verification_page(timeout_ms=otp_wait_ms):
             return
 
         if otp.strip():
@@ -279,8 +371,34 @@ class LoginPage:
         if _poll_until(
             self.page,
             lambda: self.page.title() == self.DECISION_CENTER_TITLE,
+            timeout_ms=min(30_000, timeout_sec * 1_000),
+            poll_ms=500,
+        ):
+            logger.info("Decision Center loaded after login")
+            return
+
+        title, url = self._login_state_snapshot()
+        if "hub.bi.iqvia.com" not in (url or "").lower() or self._is_mid_auth_redirect(
+            title, url
+        ):
+            logger.info(
+                "Login landing not ready (title=%r) — navigating to hub…",
+                title,
+            )
+            try:
+                self.page.goto(
+                    "https://hub.bi.iqvia.com/iam/",
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+            except Exception as exc:
+                logger.warning("Hub navigation failed: %s", exc)
+
+        if _poll_until(
+            self.page,
+            lambda: self.page.title() == self.DECISION_CENTER_TITLE,
             timeout_ms=timeout_sec * 1_000,
-            poll_ms=200,
+            poll_ms=500,
         ):
             logger.info("Decision Center loaded after login")
             return
@@ -692,6 +810,7 @@ class CreateReportPage:
     sales_data_folder = "Sales Data"
     units_item = "Units"
     values_item = "Values"
+    values_usd_item = "Values USD"
     row_drop_zone_text = "Drop a Row Dimension Here"
     add_button_text = "Add"
     query_running_text = "Query is running"
@@ -13400,11 +13519,19 @@ class CreateReportPage:
         return False
 
     def _sales_data_item_locator(self, frame, item: str):
-        """Units / Values leaf rows under Measures → Sales Data."""
+        """Units / Values leaf rows under Measures → Sales Data.
+
+        'Values' must be the leaf row, never the parent group (that group also
+        contains 'Values USD') and never the 'Values USD' sibling.
+        """
+        if item == self.values_item:
+            loc = self._sales_data_values_leaf_locator(frame)
+            if loc is not None:
+                return loc
         loc = self._resolve_tree_label_locator(
             frame,
             item,
-            deepest=False,
+            deepest=True,
             below_label=self.sales_data_folder,
             grandparent_label=self.measures_folder,
         )
@@ -13413,9 +13540,18 @@ class CreateReportPage:
         return self._resolve_tree_label_locator(
             frame,
             item,
-            deepest=False,
+            deepest=True,
             below_label=self.sales_data_folder,
         )
+
+    def _sales_data_values_leaf_locator(self, frame):
+        """Exact 'Values' leaf — never the parent group that also contains Values USD."""
+        loc = frame.get_by_text(self.values_item, exact=True).filter(
+            has_not=frame.get_by_text(self.values_usd_item, exact=True)
+        )
+        if loc.count() == 0:
+            return None
+        return loc.last
 
     def _find_pivot_measure_units_coords(self, frame) -> dict | None:
         """Click/drop point on the Units row in the RIGHT pivot measure zone."""
@@ -14037,8 +14173,16 @@ class CreateReportPage:
                     return true;
                 }
 
+                const hostRect = unitsHost.getBoundingClientRect();
                 const hostText = trim(unitsHost.textContent);
-                return hostText.includes('Units') && hostText.includes('Values');
+                return (
+                    hostRect.width > 0
+                    && hostRect.width < 280
+                    && hostRect.height < 80
+                    && hostText.includes('Units')
+                    && hostText.includes('Values')
+                    && hostText.length < 80
+                )
             }
             """,
             [tree_right],
@@ -14107,6 +14251,55 @@ class CreateReportPage:
             self.values_item,
             self.units_item,
         )
+
+    def _values_usd_in_pivot_measures(self, frame) -> bool:
+        """True when 'Values USD' is a pivot measure field (not the schema-tree leaf)."""
+        return self._resolve_pivot_field_locator(frame, self.values_usd_item) is not None
+
+    def _remove_values_usd_from_pivot(self, frame) -> bool:
+        """Remove 'Values USD' from the pivot if it was actually dropped as a measure."""
+        loc = self._resolve_pivot_field_locator(frame, self.values_usd_item)
+        if loc is None:
+            logger.info(
+                "%r not in pivot measures (tree-only) — keeping Units + Values",
+                self.values_usd_item,
+            )
+            return False
+
+        logger.info("Removing %r from measures (keep Units + Values only)…",
+                    self.values_usd_item)
+        page = frame.page
+        for attempt in range(1, 4):
+            loc = self._resolve_pivot_field_locator(frame, self.values_usd_item)
+            if loc is None:
+                logger.info("%r removed from pivot measures", self.values_usd_item)
+                return True
+            self._clear_open_popups(frame)
+            try:
+                loc.click(button="right", timeout=3_000)
+            except Exception:
+                box = loc.bounding_box()
+                if not box:
+                    continue
+                page.mouse.click(
+                    box["x"] + box["width"] * 0.8,
+                    box["y"] + box["height"] / 2,
+                    button="right",
+                )
+            self._settle(frame, 400)
+            for label in ("Remove", "Remove Measure", "Filter Out", "Hide", "Delete"):
+                if self._try_click_menu_item(label):
+                    self._wait_for_query_idle(frame, timeout_ms=12_000)
+                    break
+            self._wait_for_query_idle(frame, timeout_ms=8_000)
+
+        gone = self._resolve_pivot_field_locator(frame, self.values_usd_item) is None
+        if gone:
+            logger.info("%r removed from pivot measures", self.values_usd_item)
+        else:
+            logger.warning("%r still in pivot after removal attempts",
+                           self.values_usd_item)
+        return gone
 
     def _drag_sales_data_item_to_pivot_coords(
         self, frame, item: str, coords: dict, *, verify
@@ -14275,16 +14468,18 @@ class CreateReportPage:
         self, frame, item_label: str, drop_zone_text: str
     ) -> bool:
         """Return True when item_label appears in a pivot drop zone (not tree)."""
+        tree_right = self._schema_tree_right_edge(frame)
         return frame.evaluate(
             """
-            ([itemLabel, dropZoneText]) => {
+            ([itemLabel, dropZoneText, treeRight]) => {
                 const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const tree = document.getElementById('trvSchema')
                     || document.querySelector('[id*="trvSchema"]');
-                const inTree = (el) => tree && tree.contains(el);
+                const inTree = (el) => !!(tree && tree.contains(el));
+                const minLeft = (treeRight || 0) + 24;
 
                 for (const el of document.body.querySelectorAll(
-                    'span, a, td, div, li, label'
+                    'span, a, td, div, li, label, nobr'
                 )) {
                     const text = trim(el.textContent);
                     if (!text || text.length > 80) continue;
@@ -14292,22 +14487,30 @@ class CreateReportPage:
                     const r = el.getBoundingClientRect();
                     if (r.width <= 0 || r.height <= 0) continue;
                     if (inTree(el)) continue;
+                    if (r.left < minLeft) continue;
                     if (el.children.length > 4) continue;
                     return true;
                 }
 
-                for (const el of document.body.querySelectorAll('*')) {
+                for (const el of document.body.querySelectorAll(
+                    'span, td, div, nobr, label'
+                )) {
                     const text = trim(el.textContent);
                     if (!text.includes(dropZoneText)) continue;
-                    const host = el.closest('tr, td, table, div') || el.parentElement;
+                    if (text.length > 120) continue;
+                    const host = el.closest('tr, td') || el.parentElement;
                     if (!host) continue;
+                    const hr = host.getBoundingClientRect();
+                    if (hr.width <= 0 || hr.left < minLeft) continue;
+                    if (inTree(host)) continue;
                     const hostText = trim(host.textContent);
+                    if (hostText.length > 160) continue;
                     if (hostText.includes(itemLabel)) return true;
                 }
                 return false;
             }
             """,
-            [item_label, drop_zone_text],
+            [item_label, drop_zone_text, tree_right],
         )
 
     def _verify_column_dimension_dropped(self, frame, item_label: str) -> None:
@@ -15885,6 +16088,33 @@ class CreateReportPage:
             )
         logger.info("Verified %r in row zone", item_label)
 
+    def _try_add_tree_item_to_measures_via_menu(
+        self, frame, source_loc, *, verify
+    ) -> bool:
+        """Right-click a schema-tree measure and choose Add to Measures."""
+        start = self._locator_page_point(source_loc, x_ratio=0.42, y_ratio=0.5)
+        if not start:
+            return False
+
+        for _attempt in range(1, 4):
+            self._clear_open_popups(frame)
+            if not self._dispatch_contextmenu_at(frame, start[0], start[1]):
+                frame.page.mouse.click(start[0], start[1], button="right")
+            frame.wait_for_timeout(350)
+            for label in (
+                "Add to Measures",
+                "Add to Measure",
+                "Add as Measure",
+            ):
+                if self._try_click_menu_item(label):
+                    logger.info(
+                        "Added tree item to measures via context menu %r", label
+                    )
+                    if self._poll_until_ui(frame, verify, idle_timeout_ms=6_000):
+                        return True
+            frame.wait_for_timeout(200)
+        return False
+
     def _try_add_tree_item_to_filter_via_menu(
         self, frame, source_loc, *, verify
     ) -> bool:
@@ -16119,6 +16349,35 @@ class CreateReportPage:
 
         self._scroll_schema_label_into_view(frame, self.values_item)
         values_source = self._sales_data_item_locator(frame, self.values_item)
+        if values_source is None:
+            hints = self._tree_node_hints(frame, self.values_item)
+            raise PlaywrightTimeoutError(
+                f"Could not find {self.values_item!r} under "
+                f"{self.sales_data_folder!r} (similar: {hints})"
+            )
+
+        def values_ready() -> bool:
+            return self._values_on_units_verified(frame)
+
+        units_coords = self._find_pivot_measure_units_coords(frame)
+        if units_coords:
+            logger.info(
+                "Dragging %r from left tree onto right-side pivot %r at (%.0f, %.0f)…",
+                self.values_item,
+                self.units_item,
+                units_coords["page_x"],
+                units_coords["page_y"],
+            )
+            self._drag_sales_data_item_to_pivot_coords(
+                frame,
+                self.values_item,
+                units_coords,
+                verify=values_ready,
+            )
+            self._verify_values_on_units(frame)
+            self._remove_values_usd_from_pivot(frame)
+            return
+
         units_drop_loc = self._wait_for_pivot_measure_row(
             frame, self.units_item, timeout_ms=15_000
         )
@@ -16134,29 +16393,14 @@ class CreateReportPage:
             self.values_item,
             self.units_item,
             drop_loc=units_drop_loc,
-            deepest=False,
+            deepest=True,
             below_label=self.sales_data_folder,
             grandparent_label=self.measures_folder,
             source_loc=values_source,
-            verify=lambda: (
-                self._values_on_units_verified(frame)
-                or self._pivot_field_dropped(
-                    frame, self.values_item, self.measure_drop_zone_text
-                )
-            ),
+            verify=values_ready,
         )
-        if self._values_on_units_verified(frame):
-            logger.info(
-                "Verified %r nested on pivot %r row",
-                self.values_item,
-                self.units_item,
-            )
-        else:
-            self._verify_measure_dropped(frame, self.values_item)
-            logger.info(
-                "Verified %r in measure zone (Values dropped beside Units)",
-                self.values_item,
-            )
+        self._verify_values_on_units(frame)
+        self._remove_values_usd_from_pivot(frame)
 
     def _find_right_pivot_row_drop_coords(self, frame) -> dict | None:
         """Click/drop point on 'Drop a Row Dimension Here' in the RIGHT pivot panel."""

@@ -123,8 +123,38 @@ class IqviaSessionAuthMixin:
         if _poll_until(
             page,
             lambda: page.title() == DECISION_CENTER_TITLE,
+            timeout_ms=min(45_000, timeout_sec * 1_000),
+            poll_ms=500,
+        ):
+            logger.info("Decision Center loaded")
+            return
+
+        try:
+            title = page.title()
+            url = page.url or ""
+        except Exception:
+            title, url = "", ""
+        if "hub.bi.iqvia.com" not in url.lower() or str(title).lower().startswith(
+            "loading"
+        ):
+            logger.info(
+                "Decision Center not ready yet (title=%r) — reloading hub…",
+                title,
+            )
+            try:
+                page.goto(
+                    self.entry_url,
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+            except Exception as exc:
+                logger.warning("Hub reload failed: %s", exc)
+
+        if _poll_until(
+            page,
+            lambda: page.title() == DECISION_CENTER_TITLE,
             timeout_ms=timeout_sec * 1_000,
-            poll_ms=200,
+            poll_ms=500,
         ):
             logger.info("Decision Center loaded")
             return

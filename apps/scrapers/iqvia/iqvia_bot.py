@@ -323,22 +323,15 @@ class IqviaBot(IqviaSessionAuthMixin):
         if self.guard:
             self.guard.disable()
         try:
-            try:
-                with ctx.expect_page(timeout=DOWNLOAD_TIMEOUT_MS) as new_page_info:
-                    with ctx.expect_event("download", timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-                        export_page.clickExport()
-                new_page = new_page_info.value
-                logger.info("Export new tab: %s", (new_page.url or "")[:120])
-                return self._save_product_download(dl_info.value, product_name)
-            except Exception as primary_exc:
-                logger.warning(
-                    "Primary export capture failed (%s) — polling download folders",
-                    primary_exc,
-                )
-
+            export_page.clickExport()
             deadline = time.time() + DOWNLOAD_TIMEOUT_MS / 1000
+            last_log = 0.0
             while time.time() < deadline:
                 if captured:
+                    logger.info(
+                        "Using captured download event: %r",
+                        captured[0].suggested_filename,
+                    )
                     return self._save_product_download(captured[0], product_name)
 
                 found = self._find_new_download_file(before)
@@ -349,6 +342,17 @@ class IqviaBot(IqviaSessionAuthMixin):
                         shutil.copy2(found, dest)
                         found = dest
                     return self._finalize_product_download(found, product_name)
+
+                for path in self.download_dir.glob("*.crdownload"):
+                    sz = path.stat().st_size
+                    now = time.time()
+                    if now - last_log > 10:
+                        logger.info(
+                            "Export still downloading: %s (%d bytes)",
+                            path.name,
+                            sz,
+                        )
+                        last_log = now
 
                 page.wait_for_timeout(500)
 
@@ -411,9 +415,10 @@ class IqviaBot(IqviaSessionAuthMixin):
             if temp_destination.is_file():
                 stat = temp_destination.stat()
                 sz = stat.st_size
-                # Only accept files written by the current download (mtime within
-                # 5 min before this call) to avoid picking up stale leftovers.
-                if sz > 0 and stat.st_mtime >= call_time - 300:
+                # Accept files written during this export wait (CDP often
+                # finishes the file before Playwright's download event is used).
+                age_limit = max(300.0, DOWNLOAD_TIMEOUT_MS / 1000)
+                if sz > 0 and stat.st_mtime >= call_time - age_limit:
                     if sz == last_sz:
                         stable_ticks += 1
                         if stable_ticks >= STABLE_NEEDED:
@@ -510,7 +515,7 @@ class IqviaBot(IqviaSessionAuthMixin):
                 shutil.move(processed, final_csv)
 
         combined_csv = combined_csv_path_for(final_xlsx)
-        if combined_csv.is_file():
+        if combined_csv.is_file() and combined_csv != final_csv:
             combined_csv.unlink()
         for sidecar in (
             vtstack_csv_path_for(final_xlsx),
