@@ -557,6 +557,18 @@ class IqviaBot(IqviaSessionAuthMixin):
             self.guard.enable()
             self.guard.refresh()
 
+    def _browser_is_dead(self) -> bool:
+        """Return True when the browser/page is no longer usable."""
+        if self.browser is not None and not self.browser.is_connected():
+            return True
+        if self.page is None:
+            return True
+        try:
+            self.page.title()
+            return False
+        except Exception:
+            return True
+
     def _run_step(self, action):
         """Run one designer step while the input guard stays active."""
         self._automation_lock()
@@ -752,6 +764,10 @@ class IqviaBot(IqviaSessionAuthMixin):
                     source_row.product,
                 )
                 if row_number > 1:
+                    if self._browser_is_dead():
+                        raise RuntimeError(
+                            "Browser was closed unexpectedly — cannot continue batch"
+                        )
                     self._close_stale_designer_tabs()
                     explorer.return_to_my_reports()
 
@@ -764,6 +780,10 @@ class IqviaBot(IqviaSessionAuthMixin):
                             MAX_PRODUCT_ATTEMPTS,
                             source_row.product,
                         )
+                        if self._browser_is_dead():
+                            raise RuntimeError(
+                                "Browser was closed unexpectedly — cannot continue batch"
+                            )
                         self._close_stale_designer_tabs()
                         explorer.return_to_my_reports()
 
@@ -808,6 +828,14 @@ class IqviaBot(IqviaSessionAuthMixin):
                             MAX_PRODUCT_ATTEMPTS,
                             source_row.product,
                         )
+                        # A dead browser is unrecoverable — abort the entire batch
+                        if self._browser_is_dead():
+                            logger.error(
+                                "Browser closed after attempt %d/%d — aborting batch",
+                                attempt,
+                                MAX_PRODUCT_ATTEMPTS,
+                            )
+                            raise
                 else:
                     failed.append((source_row, last_exc or RuntimeError("unknown error")))
         finally:
