@@ -4164,11 +4164,17 @@ class CreateReportPage:
             name,
             self.product_dimension,
         )
-        self.copy_sheet_tab(current_name=source_sheet)
+        copied = self.copy_sheet_tab(
+            current_name=source_sheet, into_new_sheet=True
+        )
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
-        self._activate_copied_sheet_tab(frame, source_sheet)
-        self.rename_sheet_tab(name)
+        if not copied:
+            copied = self._activate_copied_sheet_tab(
+                frame, source_sheet, exclude=[name]
+            )
+        self.rename_sheet_tab(name, current_name=copied)
+        self._assert_sheet_still_present(source_sheet)
         self.apply_product_row_filter(product)
         logger.info("Sheet O ready — %r (no further changes after filter OK)", name)
         return name
@@ -4184,11 +4190,22 @@ class CreateReportPage:
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
         self._activate_sheet_tab(frame, source_sheet)
-        self.copy_sheet_tab(current_name=source_sheet, into_new_sheet=True)
+        copied = self.copy_sheet_tab(
+            current_name=source_sheet, into_new_sheet=True
+        )
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
-        self._activate_copied_sheet_tab(frame, source_sheet)
-        self.rename_sheet_tab(name)
+        if not copied:
+            copied = self._activate_copied_sheet_tab(
+                frame, source_sheet, exclude=[name]
+            )
+        if copied == source_sheet:
+            raise PlaywrightTimeoutError(
+                f"Copy of {source_sheet!r} did not create a new tab "
+                f"(refusing to rename C into M)"
+            )
+        self.rename_sheet_tab(name, current_name=copied)
+        self._assert_sheet_still_present(source_sheet)
         self._wait_for_query_idle(frame)
         # Innermost first: Product, then Pack — chevron → Dimension → Remove.
         self.remove_pivot_dimension(self.product_dimension)
@@ -18099,18 +18116,49 @@ class CreateReportPage:
         self._wait_for_query_idle(frame)
         logger.info("Activated sheet tab %r", resolved)
 
-    def _activate_copied_sheet_tab(self, frame, source_sheet: str) -> None:
-        """After copy, switch to the new sheet tab (rightmost, not the source)."""
+    def _assert_sheet_still_present(self, name: str) -> None:
+        """Fail fast if a required sheet tab (usually C) disappeared after rename."""
+        frame = self._designer_frame()
+        tabs = self._list_sheet_tab_names(frame)
+        want = (name or "").strip().lower()
+        prefix = want.split("-", 1)[0] + "-" if "-" in want else want
+        if any(t.lower() == want or t.lower().startswith(prefix) for t in tabs):
+            return
+        raise PlaywrightTimeoutError(
+            f"Sheet {name!r} is gone after copy/rename (tabs: {tabs}) — "
+            f"C must stay; only the new copy is renamed"
+        )
+
+    def _activate_copied_sheet_tab(
+        self,
+        frame,
+        source_sheet: str,
+        *,
+        exclude: list[str] | None = None,
+    ) -> str:
+        """After copy, switch to the new SheetN tab — never C/O/M source tabs."""
         tabs = self._list_sheet_tab_names(frame)
         if not tabs:
             raise PlaywrightTimeoutError("No sheet tabs visible after copy")
-        candidate = tabs[-1]
-        if candidate == source_sheet and len(tabs) >= 2:
-            for tab in reversed(tabs[:-1]):
-                if tab != source_sheet:
-                    candidate = tab
-                    break
+        skip = {source_sheet, *(exclude or [])}
+        sheet_n = [
+            t for t in tabs
+            if re.match(r"^Sheet\d+$", t, re.I) and t not in skip
+        ]
+        if sheet_n:
+            candidate = sheet_n[-1]
+        else:
+            candidate = next(
+                (t for t in reversed(tabs) if t not in skip),
+                None,
+            )
+        if not candidate:
+            raise PlaywrightTimeoutError(
+                f"No new sheet tab after copy of {source_sheet!r} "
+                f"(visible tabs: {tabs})"
+            )
         self._activate_sheet_tab(frame, candidate)
+        return candidate
 
     def _right_click_sheet_tab(self, frame, name: str | None = None) -> dict:
         resolved = name
@@ -18233,9 +18281,13 @@ class CreateReportPage:
         actual = self._wait_for_sheet_tab_name(frame, target)
         logger.info("Sheet renamed to %r (visible tab %r)", target, actual)
 
+    @staticmethod
+    def _is_new_sheet_option(text: str) -> bool:
+        t = re.sub(r"[()]", "", (text or "")).lower().strip()
+        return t in {"new sheet", "new worksheet", "new"} or "new sheet" in t
+
     def _select_copy_into_new_sheet(self) -> bool:
         """In Move Part / Copy dialog, set 'into sheet' to New Sheet."""
-        label = self.copy_into_new_sheet_label
         for scope in self._walk_page_frames():
             try:
                 for index in range(scope.locator("select").count()):
@@ -18246,62 +18298,87 @@ class CreateReportPage:
                         )
                     except Exception:
                         continue
-                    if not any(
-                        opt == label or "New Sheet" in opt for opt in options
-                    ):
+                    match = next(
+                        (opt for opt in options if self._is_new_sheet_option(opt)),
+                        None,
+                    )
+                    if not match:
                         continue
-                    for alt in (label, "New Sheet"):
+                    try:
+                        sel.select_option(label=match, timeout=2_000)
+                        logger.info(
+                            "Selected %r in 'into sheet' dropdown", match
+                        )
+                        return True
+                    except PlaywrightTimeoutError:
                         try:
-                            sel.select_option(label=alt, timeout=2_000)
+                            sel.select_option(value=match, timeout=1_000)
                             logger.info(
-                                "Selected %r in 'into sheet' dropdown", alt
+                                "Selected %r in 'into sheet' dropdown (value)",
+                                match,
                             )
                             return True
                         except PlaywrightTimeoutError:
                             continue
 
-                into_row = scope.locator("tr, div, td").filter(
-                    has_text=re.compile(r"into\s*sheet", re.I)
-                )
-                if into_row.count() > 0:
-                    row_sel = into_row.first.locator("select")
-                    if row_sel.count() > 0:
-                        row_sel.first.select_option(label=label, timeout=2_000)
-                        logger.info("Selected %r via into-sheet row", label)
-                        return True
-
                 picked = scope.evaluate(
                     """
-                    ([label]) => {
+                    () => {
                         const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const isNew = (t) => {
+                            const n = t.replace(/[()]/g, '').toLowerCase().trim();
+                            return n === 'new sheet' || n === 'new worksheet'
+                                || n === 'new' || n.includes('new sheet');
+                        };
                         for (const sel of document.querySelectorAll('select')) {
-                            const opts = [...sel.options].map((o) =>
-                                trim(o.textContent)
-                            );
-                            if (!opts.some((o) => o === label || o.includes('New Sheet'))) {
-                                continue;
-                            }
                             for (const opt of sel.options) {
                                 const t = trim(opt.textContent);
-                                if (t !== label && !t.includes('New Sheet')) continue;
+                                if (!isNew(t)) continue;
                                 sel.value = opt.value;
                                 sel.dispatchEvent(
                                     new Event('change', { bubbles: true })
                                 );
-                                return true;
+                                return t;
                             }
                         }
-                        return false;
+                        return '';
                     }
-                    """,
-                    [label],
+                    """
                 )
                 if picked:
-                    logger.info("Selected %r in 'into sheet' dropdown (JS)", label)
+                    logger.info(
+                        "Selected %r in 'into sheet' dropdown (JS)", picked
+                    )
                     return True
+
+                item = scope.get_by_text(
+                    re.compile(r"new\s*sheet", re.I)
+                ).first
+                if item.count() > 0:
+                    try:
+                        item.click(timeout=1_500)
+                        logger.info("Clicked 'New Sheet' text in copy dialog")
+                        return True
+                    except PlaywrightTimeoutError:
+                        pass
             except Exception:
                 continue
         return False
+
+    def _log_copy_dialog_selects(self) -> None:
+        for scope in self._walk_page_frames():
+            try:
+                n = scope.locator("select").count()
+            except Exception:
+                continue
+            for index in range(n):
+                try:
+                    opts = scope.locator("select").nth(index).evaluate(
+                        "el => [...el.options].map(o => (o.textContent || '').trim())"
+                    )
+                    logger.info("Copy dialog select[%d] options: %s", index, opts)
+                except Exception:
+                    continue
 
     def _confirm_sheet_copy_dialog(self) -> None:
         for title in (self.move_part_dialog_title, self.copy_sheet_dialog_title):
@@ -18318,49 +18395,86 @@ class CreateReportPage:
         self, *, current_name: str | None = None, into_new_sheet: bool = False
     ) -> str | None:
         """Right-click sheet tab → Copy… → (optional New Sheet) → OK."""
-        frame = self._designer_frame()
-        self._wait_for_query_idle(frame)
-        self._clear_open_popups(frame)
-        if current_name:
-            self._activate_sheet_tab(frame, current_name)
-        before = self._list_sheet_tab_names(frame)
-        self._open_sheet_tab_menu_item(
-            frame, self.copy_sheet_menu_text, current_name=current_name
-        )
-        frame.wait_for_timeout(600)
-        if into_new_sheet:
-            if not self._select_copy_into_new_sheet():
-                logger.warning(
-                    "%r not found in copy dialog — continuing with default",
-                    self.copy_into_new_sheet_label,
+        last_tabs: list[str] = []
+        for attempt in range(1, 4):
+            frame = self._designer_frame()
+            self._wait_for_query_idle(frame)
+            self._clear_open_popups(frame)
+            if current_name:
+                self._activate_sheet_tab(frame, current_name)
+            before = self._list_sheet_tab_names(frame)
+            last_tabs = before
+            self._open_sheet_tab_menu_item(
+                frame, self.copy_sheet_menu_text, current_name=current_name
+            )
+            frame.wait_for_timeout(600)
+            if into_new_sheet:
+                if not self._select_copy_into_new_sheet():
+                    logger.warning(
+                        "%r not found in copy dialog (attempt %d)",
+                        self.copy_into_new_sheet_label,
+                        attempt,
+                    )
+                    self._log_copy_dialog_selects()
+                    if attempt < 3:
+                        self._clear_open_popups(frame)
+                        continue
+                else:
+                    frame.wait_for_timeout(400)
+            try:
+                self._confirm_sheet_copy_dialog()
+            except PlaywrightTimeoutError:
+                logger.info(
+                    "No Copy/Move Part dialog OK — copy may have applied directly"
                 )
-            else:
-                frame.wait_for_timeout(400)
-        try:
-            self._confirm_sheet_copy_dialog()
-        except PlaywrightTimeoutError:
-            logger.info("No Copy/Move Part dialog OK — copy may have applied directly")
-        frame.wait_for_timeout(1_200)
+            frame.wait_for_timeout(1_200)
 
-        new_name = None
-        for _ in range(12):
-            after = self._list_sheet_tab_names(frame)
-            added = [t for t in after if t not in before]
-            if added:
-                new_name = added[-1]
-                break
-            if len(after) > len(before) and after:
-                new_name = after[-1]
-                break
-            frame.wait_for_timeout(400)
-        if new_name:
-            self._activate_sheet_tab(frame, new_name)
+            new_name = None
+            for _ in range(12):
+                after = self._list_sheet_tab_names(frame)
+                last_tabs = after
+                added = [t for t in after if t not in before]
+                if added:
+                    new_name = added[-1]
+                    break
+                sheet_n = [
+                    t for t in after
+                    if re.match(r"^Sheet\d+$", t, re.I) and t not in before
+                ]
+                if sheet_n:
+                    new_name = sheet_n[-1]
+                    break
+                if len(after) > len(before) and after:
+                    new_name = after[-1]
+                    break
+                frame.wait_for_timeout(400)
+            if new_name and new_name != current_name:
+                self._activate_sheet_tab(frame, new_name)
+                logger.info(
+                    "Sheet copied from %r — new tab %r",
+                    current_name or "(active)",
+                    new_name,
+                )
+                return new_name
+            logger.warning(
+                "Copy of %r did not create a new tab (attempt %d, tabs=%s)",
+                current_name or "(active)",
+                attempt,
+                last_tabs,
+            )
+            self._clear_open_popups(frame)
+
+        if into_new_sheet:
+            raise PlaywrightTimeoutError(
+                f"Copy of {current_name!r} did not create a new sheet tab "
+                f"(visible tabs: {last_tabs}) — C would be overwritten"
+            )
         logger.info(
             "Sheet copied from %r — new tab %r",
             current_name or "(active)",
-            new_name or "(unknown)",
+            "(unknown)",
         )
-        return new_name
+        return None
 
     # ------------------------------------------------------------------ #
     # Pivot field Dimension menu (Remove / Move Dimension to Row)        #
