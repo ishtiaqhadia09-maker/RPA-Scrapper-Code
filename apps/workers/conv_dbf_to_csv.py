@@ -1,5 +1,4 @@
-# pyright: reportMissingImports=false
-"""Standalone DBF to CSV converter using dbfread and pandas.
+"""Rename DBF exports to CSV by extension only (no content rewrite).
 
 When no input paths are given on the command line, DBF files are scanned from
 ``DBF_INPUT_DIR`` in the project ``.env`` (default: ``data/raw/DBF_FILES``).
@@ -13,25 +12,18 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterable
-
-try:
-    import pandas as pd
-    from dbfread import DBF
-except ImportError as exc:  # pragma: no cover - depends on local environment
-    missing_package = exc.name or "required package"
-    raise SystemExit(
-        "Missing dependency: "
-        f"{missing_package}. Install with `pip install pandas dbfread`."
-    ) from exc
 
 from apps.core.paths import DEFAULT_DBF_INPUT_DIR
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert DBF files into CSV.")
+    parser = argparse.ArgumentParser(
+        description="Rename DBF files to .csv (extension only, no rewrite)."
+    )
     parser.add_argument(
         "inputs",
         nargs="*",
@@ -106,60 +98,6 @@ def build_output_path(dbf_path: Path, output_dir: Path | None) -> Path:
     return output_dir / f"{dbf_path.stem}.csv"
 
 
-def _iter_all_dbf_records(table: DBF):
-    """Yield every record counted in the DBF header.
-
-    dbfread's default iterator only keeps rows whose deletion flag is a
-    space and stops at the first ``0x1A`` byte. Many real files use ``\\x00``
-    for active rows, include deleted rows in ``numrecords``, or have an
-    early EOF marker — all of which silently drop records from the CSV.
-    """
-    header = table.header
-    record_len = header.recordlen
-    num_records = header.numrecords
-
-    with open(table.filename, "rb") as infile, table._open_memofile() as memofile:
-        parse = table.parserclass(table, memofile).parse
-        infile.seek(header.headerlen)
-
-        remaining = num_records if num_records > 0 else None
-        while remaining is None or remaining > 0:
-            raw = infile.read(record_len)
-            if len(raw) < record_len:
-                break
-            # When the header count is missing, a lone EOF marker ends the file.
-            if remaining is None and raw[:1] == b"\x1a":
-                break
-
-            payload = raw[1:]
-            offset = 0
-            items = []
-            for field in table.fields:
-                length = field.length
-                chunk = payload[offset : offset + length]
-                offset += length
-                if len(chunk) < length:
-                    chunk = chunk + b"\x00" * (length - len(chunk))
-                items.append((field.name, parse(field, chunk)))
-            yield table.recfactory(items)
-            if remaining is not None:
-                remaining -= 1
-
-
-def load_dbf_as_dataframe(dbf_path: Path, encoding: str | None) -> pd.DataFrame:
-    table = DBF(
-        str(dbf_path),
-        load=False,
-        encoding=encoding,
-        ignore_missing_memofile=True,
-        char_decode_errors="ignore",
-    )
-    records = list(_iter_all_dbf_records(table))
-    if not records:
-        return pd.DataFrame(columns=list(table.field_names))
-    return pd.DataFrame.from_records(records, columns=list(table.field_names))
-
-
 def convert_dbf_to_csv(
     dbf_path: Path,
     output_dir: Path | None,
@@ -174,13 +112,7 @@ def convert_dbf_to_csv(
             f"Output file already exists: {output_path}. Use --overwrite to replace it."
         )
 
-    dataframe = load_dbf_as_dataframe(dbf_path, encoding)
-    dataframe.to_csv(
-        output_path,
-        index=False,
-        encoding=csv_encoding,
-        sep=delimiter,
-    )
+    shutil.copy2(dbf_path, output_path)
     return output_path
 
 
