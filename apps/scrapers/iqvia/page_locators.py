@@ -14287,35 +14287,54 @@ class CreateReportPage:
                     self.values_usd_item)
         page = frame.page
         for attempt in range(1, 4):
-            loc = self._resolve_pivot_field_locator(frame, self.values_usd_item)
-            if loc is None:
-                logger.info("%r removed from pivot measures", self.values_usd_item)
-                return True
-            self._clear_open_popups(frame)
             try:
-                loc.click(button="right", timeout=3_000)
-            except Exception:
-                box = loc.bounding_box()
-                if not box:
-                    continue
-                page.mouse.click(
-                    box["x"] + box["width"] * 0.8,
-                    box["y"] + box["height"] / 2,
-                    button="right",
+                loc = self._resolve_pivot_field_locator(frame, self.values_usd_item)
+                if loc is None:
+                    logger.info("%r removed from pivot measures", self.values_usd_item)
+                    return True
+                self._clear_open_popups(frame)
+                try:
+                    loc.click(button="right", timeout=3_000)
+                except Exception:
+                    box = loc.bounding_box()
+                    if not box:
+                        continue
+                    page.mouse.click(
+                        box["x"] + box["width"] * 0.8,
+                        box["y"] + box["height"] / 2,
+                        button="right",
+                    )
+                self._settle(frame, 400)
+                clicked = False
+                for label in ("Remove", "Remove Measure", "Filter Out", "Hide", "Delete"):
+                    if self._try_click_menu_item(label):
+                        try:
+                            self._wait_for_query_idle(frame, timeout_ms=12_000)
+                        except Exception:
+                            pass
+                        clicked = True
+                        break
+                if not clicked:
+                    self._clear_open_popups(frame)
+                try:
+                    self._wait_for_query_idle(frame, timeout_ms=8_000)
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning(
+                    "Attempt %d/%d — error while removing %r from pivot: %s — skipping",
+                    attempt, 3, self.values_usd_item, exc,
                 )
-            self._settle(frame, 400)
-            for label in ("Remove", "Remove Measure", "Filter Out", "Hide", "Delete"):
-                if self._try_click_menu_item(label):
-                    self._wait_for_query_idle(frame, timeout_ms=12_000)
-                    break
-            self._wait_for_query_idle(frame, timeout_ms=8_000)
+                self._clear_open_popups(frame)
 
         gone = self._resolve_pivot_field_locator(frame, self.values_usd_item) is None
         if gone:
             logger.info("%r removed from pivot measures", self.values_usd_item)
         else:
-            logger.warning("%r still in pivot after removal attempts",
-                           self.values_usd_item)
+            logger.warning(
+                "%r still in pivot after removal attempts — continuing anyway",
+                self.values_usd_item,
+            )
         return gone
 
     def _drag_sales_data_item_to_pivot_coords(
@@ -16392,7 +16411,10 @@ class CreateReportPage:
                 verify=values_ready,
             )
             self._verify_values_on_units(frame)
-            self._remove_values_usd_from_pivot(frame)
+            try:
+                self._remove_values_usd_from_pivot(frame)
+            except Exception as exc:
+                logger.warning("Could not remove %r — ignoring: %s", self.values_usd_item, exc)
             return
 
         units_drop_loc = self._wait_for_pivot_measure_row(
@@ -16417,7 +16439,10 @@ class CreateReportPage:
             verify=values_ready,
         )
         self._verify_values_on_units(frame)
-        self._remove_values_usd_from_pivot(frame)
+        try:
+            self._remove_values_usd_from_pivot(frame)
+        except Exception as exc:
+            logger.warning("Could not remove %r — ignoring: %s", self.values_usd_item, exc)
 
     def _find_right_pivot_row_drop_coords(self, frame) -> dict | None:
         """Click/drop point on 'Drop a Row Dimension Here' in the RIGHT pivot panel."""
