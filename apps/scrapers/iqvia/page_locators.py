@@ -4164,15 +4164,33 @@ class CreateReportPage:
             name,
             self.product_dimension,
         )
-        copied = self.copy_sheet_tab(
-            current_name=source_sheet, into_new_sheet=True
-        )
+        frame = self._designer_frame()
+        tabs_before = self._list_sheet_tab_names(frame)
+        copied = None
+        try:
+            copied = self.copy_sheet_tab(
+                current_name=source_sheet, into_new_sheet=True
+            )
+        except PlaywrightTimeoutError as exc:
+            logger.warning(
+                "copy_sheet_tab raised for %r — attempting fallback tab detection: %s",
+                source_sheet,
+                exc,
+            )
         frame = self._designer_frame()
         self._wait_for_query_idle(frame)
         if not copied:
-            copied = self._activate_copied_sheet_tab(
-                frame, source_sheet, exclude=[name]
-            )
+            after = self._list_sheet_tab_names(frame)
+            added = [t for t in after if t not in tabs_before and t != source_sheet]
+            if added:
+                copied = added[-1]
+                self._activate_sheet_tab(frame, copied)
+                logger.info("Sheet O copy fallback — using new tab %r", copied)
+            else:
+                raise PlaywrightTimeoutError(
+                    f"Copy of {source_sheet!r} did not create a new sheet tab "
+                    f"(visible tabs: {after}) — C would be overwritten"
+                )
         self.rename_sheet_tab(name, current_name=copied)
         self._assert_sheet_still_present(source_sheet)
         self.apply_product_row_filter(product)
@@ -17960,14 +17978,15 @@ class CreateReportPage:
                     const r = el.getBoundingClientRect();
                     return r.width > 0 && r.height > 0;
                 };
-                const looksLikeSheetTab = (text) => {
-                    if (/^Sheet\\d+$/i.test(text)) return true;
-                    if (/^[COM]-/.test(text)) return true;
-                    // Brick row labels (e.g. "1003 AGRA TAJ COLONY") sit near the
-                    // bottom of the pivot grid and must not be treated as tabs.
-                    if (/^\\d{3,}\\s/.test(text)) return false;
-                    return false;
-                };
+                    const looksLikeSheetTab = (text) => {
+                        if (/^Sheet\\s*\\d+$/i.test(text)) return true;
+                        if (/^[COM]-/.test(text)) return true;
+                        if (/^Copy of\\b/i.test(text)) return true;
+                        // Brick row labels (e.g. "1003 AGRA TAJ COLONY") sit near the
+                        // bottom of the pivot grid and must not be treated as tabs.
+                        if (/^\\d{3,}\\s/.test(text)) return false;
+                        return false;
+                    };
                 const vh = window.innerHeight
                     || document.documentElement.clientHeight;
                 const candidates = [];
@@ -18039,8 +18058,9 @@ class CreateReportPage:
                         return r.width > 0 && r.height > 0;
                     };
                     const looksLikeSheetTab = (text) => {
-                        if (/^Sheet\\d+$/i.test(text)) return true;
+                        if (/^Sheet\\s*\\d+$/i.test(text)) return true;
                         if (/^[COM]-/.test(text)) return true;
+                        if (/^Copy of\\b/i.test(text)) return true;
                         if (/^\\d{3,}\\s/.test(text)) return false;
                         return false;
                     };
@@ -18168,7 +18188,7 @@ class CreateReportPage:
         skip = {source_sheet, *(exclude or [])}
         sheet_n = [
             t for t in tabs
-            if re.match(r"^Sheet\d+$", t, re.I) and t not in skip
+            if re.match(r"^Sheet\s*\d+$", t, re.I) and t not in skip
         ]
         if sheet_n:
             candidate = sheet_n[-1]
@@ -18311,9 +18331,233 @@ class CreateReportPage:
         t = re.sub(r"[()]", "", (text or "")).lower().strip()
         return t in {"new sheet", "new worksheet", "new"} or "new sheet" in t
 
+    def _copy_dialog_visible(self) -> bool:
+        """True when the Copy / Move Part destination dialog is on screen.
+
+        Do not match the sheet-tab 'Copy...' context menu — that also contains
+        the word Copy but has no destination combo or OK button.
+        """
+        for title in (
+            self.move_part_dialog_title,
+            "Copy Sheet",
+            "Copy Worksheet",
+        ):
+            if self._scope_for_open_dialog(title) is not None:
+                return True
+        for scope in self._all_dialog_scopes():
+            try:
+                if scope.evaluate(
+                    """
+                    () => {
+                        const text = document.body
+                            ? (document.body.innerText || '') : '';
+                        if (text.includes('Move Part')) return true;
+                        const hasOk = /\\bOK\\b/.test(text);
+                        const hasNew = /new\\s*sheet/i.test(text);
+                        const hasCombo = document.querySelectorAll(
+                            'select, .RadComboBox'
+                        ).length > 0;
+                        return /\\bCopy\\b/.test(text)
+                            && hasOk
+                            && (hasNew || hasCombo);
+                    }
+                    """
+                ):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _copy_destination_is_new_sheet(self) -> bool:
+        for scope in self._all_dialog_scopes():
+            try:
+                if scope.evaluate(
+                    """
+                    () => {
+                        const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const isNew = (t) => {
+                            const n = (t || '').replace(/[()]/g, '')
+                                .toLowerCase().trim();
+                            return n === 'new sheet' || n === 'new worksheet'
+                                || n.includes('new sheet');
+                        };
+                        for (const sel of document.querySelectorAll('select')) {
+                            const opt = sel.options[sel.selectedIndex];
+                            if (opt && isNew(trim(opt.textContent))) return true;
+                        }
+                        for (const input of document.querySelectorAll(
+                            'input.rcbInput, .RadComboBox input'
+                        )) {
+                            if (isNew(trim(input.value))) return true;
+                        }
+                        for (const radio of document.querySelectorAll(
+                            'input[type="radio"]:checked'
+                        )) {
+                            const label = radio.closest('label')
+                                || radio.parentElement;
+                            if (isNew(trim(
+                                (label && label.textContent) || radio.value
+                            ))) return true;
+                        }
+                        return false;
+                    }
+                    """
+                ):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _pick_new_sheet_via_js(self, scope) -> str:
+        """Select New Sheet via native <select>, radio, or Telerik RadComboBox."""
+        try:
+            return scope.evaluate(
+                """
+                () => {
+                    const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const isNew = (t) => {
+                        const n = (t || '').replace(/[()]/g, '')
+                            .toLowerCase().trim();
+                        return n === 'new sheet' || n === 'new worksheet'
+                            || n === 'new' || n.includes('new sheet');
+                    };
+
+                    for (const sel of document.querySelectorAll('select')) {
+                        for (const opt of sel.options) {
+                            const t = trim(opt.textContent);
+                            if (!isNew(t)) continue;
+                            opt.selected = true;
+                            sel.value = opt.value;
+                            sel.dispatchEvent(
+                                new Event('change', { bubbles: true })
+                            );
+                            return t;
+                        }
+                    }
+
+                    for (const el of document.querySelectorAll(
+                        'input[type="radio"], label, span, a, td'
+                    )) {
+                        const t = trim(el.value || el.textContent);
+                        if (!isNew(t) || t.length > 40) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        el.click();
+                        return t;
+                    }
+
+                    for (const combo of document.querySelectorAll('.RadComboBox')) {
+                        const widget = window.$find
+                            ? window.$find(combo.id) : null;
+                        if (!widget) continue;
+                        try { if (widget.showDropDown) widget.showDropDown(); }
+                        catch (e) {}
+                        if (widget.findItemByText) {
+                            for (const label of [
+                                'New Sheet', '(New Sheet)', 'New Worksheet'
+                            ]) {
+                                const item = widget.findItemByText(label);
+                                if (!item) continue;
+                                if (item.select) item.select();
+                                else if (widget.selectItem)
+                                    widget.selectItem(item.get_index());
+                                return label;
+                            }
+                        }
+                        if (widget.get_items) {
+                            const items = widget.get_items();
+                            for (let i = 0; i < items.get_count(); i++) {
+                                const item = items.getItem(i);
+                                const t = trim(item.get_text());
+                                if (!isNew(t)) continue;
+                                if (item.select) item.select();
+                                else if (widget.selectItem)
+                                    widget.selectItem(i);
+                                return t;
+                            }
+                        }
+                    }
+                    return '';
+                }
+                """
+            ) or ""
+        except Exception:
+            return ""
+
+    def _open_copy_destination_combo(self) -> bool:
+        """Click the Copy/Move Part destination combobox arrow."""
+        for scope in self._all_dialog_scopes():
+            try:
+                hit = scope.evaluate(
+                    """
+                    () => {
+                        const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const body = document.body
+                            ? (document.body.innerText || '') : '';
+                        if (!body.includes('Move Part')
+                            && !body.includes('Copy')) return null;
+
+                        const arrows = document.querySelectorAll(
+                            '.RadComboBox .rcbArrowCell, '
+                            + '.RadComboBox .rcbArrowCell a, '
+                            + '.rcbArrowCell, select'
+                        );
+                        let best = null;
+                        for (const el of arrows) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            const score = r.top * 10 + r.left;
+                            if (!best || score > best.score) {
+                                best = {
+                                    x: r.x + r.width / 2,
+                                    y: r.y + r.height / 2,
+                                    score,
+                                };
+                            }
+                        }
+                        if (best) return { x: best.x, y: best.y };
+
+                        for (const combo of document.querySelectorAll(
+                            '.RadComboBox, input.rcbInput'
+                        )) {
+                            const r = combo.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            return {
+                                x: r.x + Math.max(r.width - 14, r.width * 0.85),
+                                y: r.y + r.height / 2,
+                            };
+                        }
+                        return null;
+                    }
+                    """
+                )
+            except Exception:
+                continue
+            if not hit:
+                continue
+            try:
+                if scope is self.page:
+                    px, py = hit["x"], hit["y"]
+                else:
+                    px, py = self._frame_page_point(
+                        scope, hit["x"], hit["y"]
+                    )
+            except Exception:
+                px, py = hit["x"], hit["y"]
+            self.page.mouse.click(px, py)
+            logger.info("Opened copy-destination dropdown")
+            return True
+        return False
+
     def _select_copy_into_new_sheet(self) -> bool:
-        """In Move Part / Copy dialog, set 'into sheet' to New Sheet."""
-        for scope in self._walk_page_frames():
+        """In Move Part / Copy dialog, set destination to New Sheet."""
+        if self._copy_destination_is_new_sheet():
+            logger.info(
+                "Copy destination already %r", self.copy_into_new_sheet_label
+            )
+            return True
+
+        for scope in self._all_dialog_scopes():
             try:
                 for index in range(scope.locator("select").count()):
                     sel = scope.locator("select").nth(index)
@@ -18346,52 +18590,54 @@ class CreateReportPage:
                         except PlaywrightTimeoutError:
                             continue
 
-                picked = scope.evaluate(
-                    """
-                    () => {
-                        const trim = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                        const isNew = (t) => {
-                            const n = t.replace(/[()]/g, '').toLowerCase().trim();
-                            return n === 'new sheet' || n === 'new worksheet'
-                                || n === 'new' || n.includes('new sheet');
-                        };
-                        for (const sel of document.querySelectorAll('select')) {
-                            for (const opt of sel.options) {
-                                const t = trim(opt.textContent);
-                                if (!isNew(t)) continue;
-                                sel.value = opt.value;
-                                sel.dispatchEvent(
-                                    new Event('change', { bubbles: true })
-                                );
-                                return t;
-                            }
-                        }
-                        return '';
-                    }
-                    """
-                )
+                picked = self._pick_new_sheet_via_js(scope)
                 if picked:
                     logger.info(
-                        "Selected %r in 'into sheet' dropdown (JS)", picked
+                        "Selected %r in copy destination (JS)", picked
                     )
                     return True
-
-                item = scope.get_by_text(
-                    re.compile(r"new\s*sheet", re.I)
-                ).first
-                if item.count() > 0:
-                    try:
-                        item.click(timeout=1_500)
-                        logger.info("Clicked 'New Sheet' text in copy dialog")
-                        return True
-                    except PlaywrightTimeoutError:
-                        pass
             except Exception:
                 continue
-        return False
+
+        if self._open_copy_destination_combo():
+            try:
+                frame = self._designer_frame()
+                frame.wait_for_timeout(400)
+            except PlaywrightTimeoutError:
+                frame = None
+            clicked = None
+            if frame is not None:
+                clicked = self._click_combo_list_item(
+                    frame, "New Sheet", partial=True
+                )
+            if not clicked:
+                for scope in self._all_dialog_scopes():
+                    try:
+                        item = scope.get_by_text(
+                            re.compile(r"new\s*sheet", re.I)
+                        )
+                        for idx in range(min(item.count(), 8)):
+                            node = item.nth(idx)
+                            try:
+                                if not node.is_visible(timeout=400):
+                                    continue
+                                node.click(timeout=2_000)
+                                clicked = "New Sheet"
+                                break
+                            except PlaywrightTimeoutError:
+                                continue
+                    except Exception:
+                        continue
+                    if clicked:
+                        break
+            if clicked:
+                logger.info("Clicked copy-destination option %r", clicked)
+                return True
+
+        return self._copy_destination_is_new_sheet()
 
     def _log_copy_dialog_selects(self) -> None:
-        for scope in self._walk_page_frames():
+        for scope in self._all_dialog_scopes():
             try:
                 n = scope.locator("select").count()
             except Exception:
@@ -18404,14 +18650,33 @@ class CreateReportPage:
                     logger.info("Copy dialog select[%d] options: %s", index, opts)
                 except Exception:
                     continue
+            try:
+                combos = scope.evaluate(
+                    """
+                    () => [...document.querySelectorAll(
+                        '.RadComboBox input, input.rcbInput'
+                    )].map((el) => (el.value || '').trim()).filter(Boolean)
+                    """
+                )
+                if combos:
+                    logger.info("Copy dialog combo values: %s", combos)
+            except Exception:
+                continue
 
     def _confirm_sheet_copy_dialog(self) -> None:
-        for title in (self.move_part_dialog_title, self.copy_sheet_dialog_title):
+        for title in (
+            self.move_part_dialog_title,
+            self.copy_sheet_dialog_title,
+            "Copy Sheet",
+            "Copy Worksheet",
+        ):
             try:
                 self._click_dialog_ok(title)
                 return
             except PlaywrightTimeoutError:
                 continue
+        if self._click_ok_in_any_frame(self.move_part_dialog_title):
+            return
         raise PlaywrightTimeoutError(
             "Could not confirm sheet copy / Move Part dialog"
         )
@@ -18421,6 +18686,7 @@ class CreateReportPage:
     ) -> str | None:
         """Right-click sheet tab → Copy… → (optional New Sheet) → OK."""
         last_tabs: list[str] = []
+        tabs_before_copy: list[str] = []
         for attempt in range(1, 4):
             frame = self._designer_frame()
             self._wait_for_query_idle(frame)
@@ -18429,33 +18695,49 @@ class CreateReportPage:
                 self._activate_sheet_tab(frame, current_name)
             before = self._list_sheet_tab_names(frame)
             last_tabs = before
+            if not tabs_before_copy:
+                tabs_before_copy = list(before)
             self._open_sheet_tab_menu_item(
                 frame, self.copy_sheet_menu_text, current_name=current_name
             )
-            frame.wait_for_timeout(600)
+            frame.wait_for_timeout(800)
             if into_new_sheet:
+                dialog_ready = self._poll_until(
+                    frame,
+                    self._copy_dialog_visible,
+                    timeout_ms=6_000,
+                )
+                if not dialog_ready:
+                    logger.warning(
+                        "Copy/Move Part dialog did not open (attempt %d)",
+                        attempt,
+                    )
+                    self._clear_open_popups(frame)
+                    continue
                 if not self._select_copy_into_new_sheet():
                     logger.warning(
-                        "%r not found in copy dialog (attempt %d)",
+                        "%r not found in copy dialog (attempt %d) — not confirming",
                         self.copy_into_new_sheet_label,
                         attempt,
                     )
                     self._log_copy_dialog_selects()
-                    if attempt < 3:
-                        self._clear_open_popups(frame)
-                        continue
-                else:
-                    frame.wait_for_timeout(400)
+                    self._clear_open_popups(frame)
+                    continue
+                frame.wait_for_timeout(400)
             try:
                 self._confirm_sheet_copy_dialog()
             except PlaywrightTimeoutError:
                 logger.info(
                     "No Copy/Move Part dialog OK — copy may have applied directly"
                 )
+            try:
+                self._wait_for_query_idle(frame, timeout_ms=20_000)
+            except Exception:
+                pass
             frame.wait_for_timeout(1_200)
 
             new_name = None
-            for _ in range(12):
+            for _ in range(24):
                 after = self._list_sheet_tab_names(frame)
                 last_tabs = after
                 added = [t for t in after if t not in before]
@@ -18464,7 +18746,7 @@ class CreateReportPage:
                     break
                 sheet_n = [
                     t for t in after
-                    if re.match(r"^Sheet\d+$", t, re.I) and t not in before
+                    if re.match(r"^Sheet\s*\d+$", t, re.I) and t not in before
                 ]
                 if sheet_n:
                     new_name = sheet_n[-1]
@@ -18472,7 +18754,7 @@ class CreateReportPage:
                 if len(after) > len(before) and after:
                     new_name = after[-1]
                     break
-                frame.wait_for_timeout(400)
+                frame.wait_for_timeout(500)
             if new_name and new_name != current_name:
                 self._activate_sheet_tab(frame, new_name)
                 logger.info(
@@ -18490,6 +18772,21 @@ class CreateReportPage:
             self._clear_open_popups(frame)
 
         if into_new_sheet:
+            frame = self._designer_frame()
+            after = self._list_sheet_tab_names(frame)
+            added = [
+                t for t in after
+                if t not in tabs_before_copy and t != current_name
+            ]
+            if added:
+                fallback = added[-1]
+                self._activate_sheet_tab(frame, fallback)
+                logger.info(
+                    "Copy of %r — found late-appearing tab %r via fallback",
+                    current_name or "(active)",
+                    fallback,
+                )
+                return fallback
             raise PlaywrightTimeoutError(
                 f"Copy of {current_name!r} did not create a new sheet tab "
                 f"(visible tabs: {last_tabs}) — C would be overwritten"
