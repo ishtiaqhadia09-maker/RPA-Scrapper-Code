@@ -1,4 +1,4 @@
-"""Rename DBF exports to CSV by extension only (no content rewrite).
+"""Convert DBF exports to UTF-8 CSV.
 
 When no input paths are given on the command line, DBF files are scanned from
 ``DBF_INPUT_DIR`` in the project ``.env`` (default: ``data/raw/DBF_FILES``).
@@ -12,17 +12,23 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import shutil
+import csv
 import sys
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+from dbfread import DBF
 
 from apps.core.paths import DEFAULT_DBF_INPUT_DIR
+
+_CSV_BATCH_SIZE = 1000
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rename DBF files to .csv (extension only, no rewrite)."
+        description="Convert DBF files to UTF-8 CSV."
     )
     parser.add_argument(
         "inputs",
@@ -98,6 +104,34 @@ def build_output_path(dbf_path: Path, output_dir: Path | None) -> Path:
     return output_dir / f"{dbf_path.stem}.csv"
 
 
+def _csv_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "T" if value else "F"
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, str):
+        return value.rstrip()
+    return value
+
+
+def _open_dbf(dbf_path: Path, encoding: str | None) -> DBF:
+    kwargs: dict[str, Any] = {
+        "ignore_missing_memofile": True,
+        "char_decode_errors": "replace",
+    }
+    if encoding:
+        kwargs["encoding"] = encoding
+    return DBF(str(dbf_path), **kwargs)
+
+
 def convert_dbf_to_csv(
     dbf_path: Path,
     output_dir: Path | None,
@@ -112,7 +146,31 @@ def convert_dbf_to_csv(
             f"Output file already exists: {output_path}. Use --overwrite to replace it."
         )
 
-    shutil.copy2(dbf_path, output_path)
+    table = _open_dbf(dbf_path, encoding)
+    field_names = list(table.field_names)
+    temp_path = output_path.with_name(f".{output_path.name}.tmp")
+    try:
+        with temp_path.open(
+            "w",
+            newline="",
+            encoding=csv_encoding,
+            errors="strict",
+        ) as handle:
+            writer = csv.writer(handle, delimiter=delimiter)
+            writer.writerow(field_names)
+            batch: list[list[Any]] = []
+            for record in table:
+                batch.append([_csv_value(record.get(name)) for name in field_names])
+                if len(batch) >= _CSV_BATCH_SIZE:
+                    writer.writerows(batch)
+                    batch.clear()
+            if batch:
+                writer.writerows(batch)
+        temp_path.replace(output_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
     return output_path
 
 
