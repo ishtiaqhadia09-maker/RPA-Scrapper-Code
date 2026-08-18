@@ -14,10 +14,12 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dbfread import DBF
 
@@ -128,20 +130,11 @@ def select_csv_field_names(
 
 
 def _csv_value(value: Any) -> Any:
+    """Write DBF values to CSV without reformatting parsed field data."""
     if value is None:
         return ""
-    if isinstance(value, bool):
-        return "T" if value else "F"
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ", timespec="seconds")
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return format(value, "f")
-    if isinstance(value, str):
-        return value.rstrip()
     return value
 
 

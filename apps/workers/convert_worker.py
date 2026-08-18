@@ -14,7 +14,11 @@ from apps.core.paths import (
     ensure_data_dirs,
     remove_dir_if_empty,
 )
-from apps.workers.conv_dbf_to_csv import convert_dbf_to_csv, resolve_inputs
+from apps.workers.conv_dbf_to_csv import (
+    EXCEL_DBF_FIELD_LIMIT,
+    convert_dbf_to_csv,
+    resolve_inputs,
+)
 
 
 def run_convert(
