@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from apps.workers.conv_dbf_to_csv import convert_dbf_to_csv
+from apps.workers.conv_dbf_to_csv import convert_dbf_to_csv, select_csv_field_names
 
 
 def _write_minimal_dbf(path: Path) -> None:
@@ -62,3 +62,32 @@ def test_convert_dbf_to_csv_writes_utf8_text(tmp_path: Path) -> None:
         "Ibuprofen,3",
     ]
     assert csv_path.read_bytes()[:1] != b"\x03"
+
+
+def test_select_csv_field_names_matches_excel_dbf_limit() -> None:
+    names = [f"F{i:03d}" for i in range(774)]
+    assert len(select_csv_field_names(names)) == 255
+    assert select_csv_field_names(names) == names[:255]
+    assert select_csv_field_names(names, max_fields=0) == names
+    assert select_csv_field_names(["A", "B"], max_fields=255) == ["A", "B"]
+
+
+def test_convert_dbf_to_csv_can_limit_columns(tmp_path: Path) -> None:
+    dbf_path = tmp_path / "SAMPLE.dbf"
+    _write_minimal_dbf(dbf_path)
+
+    csv_path = convert_dbf_to_csv(
+        dbf_path=dbf_path,
+        output_dir=tmp_path / "out",
+        encoding=None,
+        csv_encoding="utf-8",
+        delimiter=",",
+        overwrite=False,
+        max_fields=1,
+    )
+
+    assert csv_path.read_text(encoding="utf-8").splitlines() == [
+        "NAME",
+        "Aspirin",
+        "Ibuprofen",
+    ]

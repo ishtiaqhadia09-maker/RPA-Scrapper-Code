@@ -24,6 +24,9 @@ from dbfread import DBF
 from apps.core.paths import DEFAULT_DBF_INPUT_DIR
 
 _CSV_BATCH_SIZE = 1000
+# Excel / dBase tools only display 255 DBF fields. IMS files store extra
+# MTH/MAT measure fields after that; keep CSV aligned with the Excel view.
+EXCEL_DBF_FIELD_LIMIT = 255
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +72,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing CSV files.",
     )
+    parser.add_argument(
+        "--max-fields",
+        type=int,
+        default=EXCEL_DBF_FIELD_LIMIT,
+        help=(
+            "Write at most this many DBF fields (default 255, matching Excel). "
+            "Use 0 to export every field."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,6 +114,17 @@ def build_output_path(dbf_path: Path, output_dir: Path | None) -> Path:
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{dbf_path.stem}.csv"
+
+
+def select_csv_field_names(
+    field_names: list[str],
+    max_fields: int = EXCEL_DBF_FIELD_LIMIT,
+) -> list[str]:
+    """Keep CSV columns aligned with Excel's 255-field DBF view."""
+    names = list(field_names)
+    if max_fields <= 0:
+        return names
+    return names[:max_fields]
 
 
 def _csv_value(value: Any) -> Any:
@@ -139,6 +162,7 @@ def convert_dbf_to_csv(
     csv_encoding: str,
     delimiter: str,
     overwrite: bool,
+    max_fields: int = EXCEL_DBF_FIELD_LIMIT,
 ) -> Path:
     output_path = build_output_path(dbf_path, output_dir)
     if output_path.exists() and not overwrite:
@@ -147,7 +171,7 @@ def convert_dbf_to_csv(
         )
 
     table = _open_dbf(dbf_path, encoding)
-    field_names = list(table.field_names)
+    field_names = select_csv_field_names(list(table.field_names), max_fields)
     temp_path = output_path.with_name(f".{output_path.name}.tmp")
     try:
         with temp_path.open(
@@ -207,6 +231,7 @@ def main() -> int:
             csv_encoding=args.csv_encoding,
             delimiter=args.delimiter,
             overwrite=args.overwrite,
+            max_fields=args.max_fields,
         )
         converted_count += 1
         render_progress(converted_count, total_files)
