@@ -26,9 +26,13 @@ from dbfread import DBF
 from apps.core.paths import DEFAULT_DBF_INPUT_DIR
 
 _CSV_BATCH_SIZE = 1000
-# Excel / dBase tools only display 255 DBF fields. IMS files store extra
-# MTH/MAT measure fields after that; keep CSV aligned with the Excel view.
-EXCEL_DBF_FIELD_LIMIT = 255
+# Excel / dBase tools only display the first 255 DBF fields in their grid view,
+# but the DBF file itself can (and often does, e.g. IMS exports with extra
+# MTH/MAT measure columns) contain far more. We want the CSV to reflect the
+# real field count, so no truncation is applied by default. Pass a positive
+# max_fields to convert_dbf_to_csv()/select_csv_field_names() to opt into the
+# old Excel-view-limited behavior.
+EXCEL_DBF_FIELD_LIMIT = 0
 
 
 def parse_args() -> argparse.Namespace:
