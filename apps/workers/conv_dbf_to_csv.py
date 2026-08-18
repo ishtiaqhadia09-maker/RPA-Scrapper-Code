@@ -74,15 +74,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing CSV files.",
     )
-    parser.add_argument(
-        "--max-fields",
-        type=int,
-        default=EXCEL_DBF_FIELD_LIMIT,
-        help=(
-            "Write at most this many DBF fields (default 255, matching Excel). "
-            "Use 0 to export every field."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -156,7 +147,7 @@ def convert_dbf_to_csv(
     delimiter: str,
     overwrite: bool,
     max_fields: int = EXCEL_DBF_FIELD_LIMIT,
-) -> Path:
+) -> dict[str, Any]:
     output_path = build_output_path(dbf_path, output_dir)
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -164,6 +155,7 @@ def convert_dbf_to_csv(
         )
 
     table = _open_dbf(dbf_path, encoding)
+    source_field_count = len(table.field_names)
     field_names = select_csv_field_names(list(table.field_names), max_fields)
     temp_path = output_path.with_name(f".{output_path.name}.tmp")
     try:
@@ -188,7 +180,11 @@ def convert_dbf_to_csv(
         if temp_path.exists():
             temp_path.unlink()
         raise
-    return output_path
+    return {
+        "output_path": output_path,
+        "source_field_count": source_field_count,
+        "csv_field_count": len(field_names),
+    }
 
 
 def render_progress(current: int, total: int) -> None:
@@ -217,14 +213,17 @@ def main() -> int:
 
     converted_count = 0
     for dbf_file in dbf_files:
-        convert_dbf_to_csv(
+        result = convert_dbf_to_csv(
             dbf_path=dbf_file,
             output_dir=args.output_dir,
             encoding=args.encoding,
             csv_encoding=args.csv_encoding,
             delimiter=args.delimiter,
             overwrite=args.overwrite,
-            max_fields=args.max_fields,
+        )
+        print(
+            f"\n{dbf_file.name}: {result['source_field_count']} DBF fields -> "
+            f"{result['csv_field_count']} CSV columns -> {result['output_path'].name}"
         )
         converted_count += 1
         render_progress(converted_count, total_files)

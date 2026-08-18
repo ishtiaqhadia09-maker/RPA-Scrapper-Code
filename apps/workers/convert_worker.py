@@ -77,14 +77,16 @@ def run_convert(
                     current_file=dbf_path.name,
                     detail=f"Converting {dbf_path.name}",
                 )
-            csv_path = convert_dbf_to_csv(
+            result = convert_dbf_to_csv(
                 dbf_path=dbf_path,
                 output_dir=out_dir,
                 encoding=encoding,
                 csv_encoding=csv_encoding,
                 delimiter=delimiter,
                 overwrite=overwrite,
+                max_fields=EXCEL_DBF_FIELD_LIMIT,
             )
+            csv_path = result["output_path"]
             converted.append(str(csv_path))
             if job is not None:
                 registry.update_progress(
