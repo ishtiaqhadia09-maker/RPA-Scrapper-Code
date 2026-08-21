@@ -465,8 +465,58 @@ class HubPage:
         return _poll_for_frame(self.page, self.user_main_frame_url, timeout_ms)
 
     def clickMyReports(self) -> None:
-        frame = self._user_main_frame()
-        frame.locator(self.my_reports_link, has_text="My Reports").click()
+        """
+        Open My Reports from the current Decision Center hub.
+
+        IQVIA can rebuild/detach UserMainPage.aspx while the hub is settling.
+        Re-acquire the frame and locator for each attempt instead of reusing a
+        detached Frame object.
+        """
+        last_error = None
+
+        for attempt in range(5):
+            try:
+                # Always get a fresh frame. IQVIA may replace the iframe during
+                # navigation, which makes a previously captured Frame invalid.
+                frame = self._user_main_frame(timeout_ms=30_000)
+
+                link = frame.locator(
+                    self.my_reports_href
+                ).filter(has_text="My Reports").first
+
+                link.wait_for(state="visible", timeout=10_000)
+
+                # Give IQVIA a short opportunity to finish replacing the frame.
+                self.page.wait_for_timeout(300)
+
+                link.click(timeout=15_000)
+                logger.info("My Reports clicked successfully")
+                return
+
+            except PlaywrightError as exc:
+                last_error = exc
+                message = str(exc)
+
+                if "Frame was detached" not in message:
+                    raise
+
+                logger.warning(
+                    "My Reports frame detached while clicking "
+                    "(attempt %d/5) — reacquiring frame…",
+                    attempt + 1,
+                )
+
+                # Do not keep using the old frame. Wait briefly and reacquire it
+                # on the next iteration.
+                try:
+                    self.page.wait_for_timeout(FRAME_POLL_MS * 2)
+                except Exception:
+                    pass
+
+        raise PlaywrightError(
+            "Unable to click My Reports because the IQVIA hub frame "
+            "continued to detach after 5 attempts."
+        ) from last_error
 
 
 class ExplorerPage:
@@ -18229,9 +18279,24 @@ class CreateReportPage:
         frame.wait_for_timeout(200)
         page.mouse.click(box["page_x"], box["page_y"], button="right")
         frame.wait_for_timeout(300)
-        if not self._is_menu_item_visible(self.rename_sheet_menu_text, partial=True):
-            self._dispatch_contextmenu_at(frame, box["page_x"], box["page_y"])
-            frame.wait_for_timeout(300)
+
+        # Do not use only Rename as proof that the sheet-tab menu opened.
+        # Copy... is the operation most commonly used by this workflow and
+        # can appear slightly later than the rest of the menu.
+        menu_open = self._is_menu_item_visible(
+            self.rename_sheet_menu_text, partial=True
+        ) or self._is_menu_item_visible(
+            self.copy_sheet_menu_text, partial=True
+        ) or self._is_menu_item_visible(
+            self.move_or_copy_menu_text, partial=True
+        )
+
+        if not menu_open:
+            self._dispatch_contextmenu_at(
+                frame, box["page_x"], box["page_y"]
+            )
+            frame.wait_for_timeout(500)
+
         logger.info("Right-clicked sheet tab %r", box["text"])
         return box
 
@@ -18280,28 +18345,90 @@ class CreateReportPage:
     def _open_sheet_tab_menu_item(
         self, frame, item_label: str, *, current_name: str | None = None
     ) -> None:
-        """Right-click a sheet tab and click a context-menu item, with retries."""
-        menu_ready = lambda: self._is_menu_item_visible(item_label, partial=True)
+        """Right-click a sheet tab and click a context-menu item reliably.
+
+        IQVIA can render the sheet-tab context menu asynchronously.  In that
+        case a single right-click may succeed visually while the menu items
+        are not yet present in the DOM.  Retry the complete operation and
+        explicitly wait for the requested item before clicking it.
+        """
         last_exc: Exception | None = None
-        for attempt in range(1, 6):
-            self._right_click_sheet_tab(frame, current_name)
-            if self._poll_until(frame, menu_ready, timeout_ms=4_000):
+
+        def menu_ready() -> bool:
+            # The requested item is the only item we ultimately need.
+            if self._is_menu_item_visible(item_label, partial=True):
+                return True
+
+            # If the menu is open but the requested item is still rendering,
+            # one of these standard sheet-tab actions is a useful signal that
+            # the context menu itself has appeared.
+            for label in (
+                self.rename_sheet_menu_text,
+                self.copy_sheet_menu_text,
+                self.move_or_copy_menu_text,
+            ):
                 try:
-                    self._click_menu_item(item_label)
-                    return
-                except PlaywrightTimeoutError as exc:
-                    last_exc = exc
+                    if self._is_menu_item_visible(label, partial=True):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        for attempt in range(1, 8):
+            try:
+                self._right_click_sheet_tab(frame, current_name)
+
+                # Wait for the context menu to render.  The requested item
+                # gets an additional wait below because IQVIA/Telerik can
+                # populate menu entries a little after the menu container.
+                if self._poll_until(
+                    frame,
+                    menu_ready,
+                    timeout_ms=6_000,
+                    poll_ms=100,
+                ):
+                    if self._poll_until(
+                        frame,
+                        lambda: self._is_menu_item_visible(
+                            item_label, partial=True
+                        ),
+                        timeout_ms=3_000,
+                        poll_ms=100,
+                    ):
+                        self._click_menu_item(item_label)
+                        return
+
+            except PlaywrightTimeoutError as exc:
+                last_exc = exc
+            except PlaywrightError as exc:
+                last_exc = exc
+
             logger.info(
-                "Sheet-tab menu item %r not ready (attempt %d) — retrying",
+                "Sheet-tab menu item %r not ready "
+                "(attempt %d/7) — clearing and retrying",
                 item_label,
                 attempt,
             )
-            self._clear_open_popups(frame)
-            frame.wait_for_timeout(600)
+
+            try:
+                self._clear_open_popups(frame)
+            except Exception:
+                pass
+
+            # Remove a stale context menu/overlay before the next right-click.
+            try:
+                frame.page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+            frame.wait_for_timeout(800)
+
         if last_exc is not None:
             raise last_exc
+
         raise PlaywrightTimeoutError(
-            f"Sheet-tab context menu item {item_label!r} did not appear"
+            f"Sheet-tab context menu item {item_label!r} did not appear "
+            f"after 7 attempts"
         )
 
     def rename_sheet_tab(
